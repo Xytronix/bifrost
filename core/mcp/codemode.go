@@ -54,6 +54,12 @@ type CodeModeConfig struct {
 
 	// ToolExecutionTimeout is the maximum time allowed for tool execution
 	ToolExecutionTimeout time.Duration
+
+	// OmitEnvironmentFooter, when true, suppresses the trailing
+	// "Environment:\n  Available server keys: ..." block appended to
+	// executeToolCode responses (issue #4434). Reduces per-call token
+	// overhead when the caller already knows the connected servers.
+	OmitEnvironmentFooter bool
 }
 
 // CodeModeDependencies holds the dependencies required by CodeMode implementations.

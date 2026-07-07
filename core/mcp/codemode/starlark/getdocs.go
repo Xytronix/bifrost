@@ -140,14 +140,12 @@ func (s *StarlarkCodeMode) handleGetToolDocs(ctx context.Context, toolCall schem
 func generateTypeDefinitions(clientName string, tools []schemas.ChatTool, isToolLevel bool) string {
 	var sb strings.Builder
 
-	// Write comprehensive header
-	sb.WriteString("# ============================================================================\n")
+	// Write header (lightweight markdown; heavy ASCII dividers removed per #4434)
 	if isToolLevel && len(tools) == 1 && tools[0].Function != nil {
-		sb.WriteString(fmt.Sprintf("# Documentation for %s.%s tool\n", clientName, getCanonicalToolName(clientName, tools[0].Function.Name)))
+		sb.WriteString(fmt.Sprintf("### Documentation: %s.%s\n", clientName, getCanonicalToolName(clientName, tools[0].Function.Name)))
 	} else {
-		sb.WriteString(fmt.Sprintf("# Documentation for %s MCP server\n", clientName))
+		sb.WriteString(fmt.Sprintf("### Documentation: %s MCP server\n", clientName))
 	}
-	sb.WriteString("# ============================================================================\n")
 	sb.WriteString("#\n")
 	if isToolLevel && len(tools) == 1 {
 		sb.WriteString("# This file contains Python documentation for a specific tool on this MCP server.\n")
@@ -171,7 +169,7 @@ func generateTypeDefinitions(clientName string, tools []schemas.ChatTool, isTool
 	sb.WriteString("#\n")
 	sb.WriteString("# Common error: \"key not found\" or \"has no attribute\"\n")
 	sb.WriteString("# Fix: Use print() to see actual structure, then use result[\"key\"] or .get()\n")
-	sb.WriteString("# ============================================================================\n\n")
+	sb.WriteString("\n")
 
 	// Generate function definitions for each tool
 	for _, tool := range tools {

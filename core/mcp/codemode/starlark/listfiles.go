@@ -4,6 +4,7 @@ package starlark
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -52,7 +53,12 @@ func (s *StarlarkCodeMode) createListToolFilesTool() schemas.ChatTool {
 			Description: schemas.Ptr(description),
 			Parameters: &schemas.ToolFunctionParameters{
 				Type:       "object",
-				Properties: schemas.NewOrderedMap(),
+				Properties: schemas.NewOrderedMapFromPairs(
+					schemas.KV("server", map[string]interface{}{
+						"type":        "string",
+						"description": "Optional: restrict the listing to a single server by its display name (case-insensitive). Omit to list all connected code-mode servers.",
+					}),
+				),
 				Required:   []string{},
 			},
 		},
@@ -63,6 +69,18 @@ func (s *StarlarkCodeMode) createListToolFilesTool() schemas.ChatTool {
 // It builds a tree structure listing all virtual .pyi files available for code mode clients.
 func (s *StarlarkCodeMode) handleListToolFiles(ctx context.Context, toolCall schemas.ChatAssistantMessageToolCall) (*schemas.ChatMessage, error) {
 	availableToolsPerClient := s.clientManager.GetToolPerClient(ctx)
+
+	// Optional single-server filter (issue #4434): when set, only that server's
+	// stubs are listed instead of every connected server.
+	var serverFilter string
+	if strings.TrimSpace(toolCall.Function.Arguments) != "" {
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err == nil {
+			if sv, ok := args["server"].(string); ok {
+				serverFilter = strings.ToLower(strings.TrimSpace(sv))
+			}
+		}
+	}
 
 	if len(availableToolsPerClient) == 0 {
 		responseText := "No servers are currently connected. There are no virtual .pyi files available. " +
@@ -78,6 +96,9 @@ func (s *StarlarkCodeMode) handleListToolFiles(ctx context.Context, toolCall sch
 	codeModeServerCount := 0
 
 	for clientName, tools := range availableToolsPerClient {
+		if serverFilter != "" && strings.ToLower(clientName) != serverFilter {
+			continue
+		}
 		client := s.clientManager.GetClientByName(clientName)
 		if client == nil {
 			s.logger.Warn("%s Client %s not found, skipping", codemcp.CodeModeLogPrefix, clientName)
@@ -110,6 +131,9 @@ func (s *StarlarkCodeMode) handleListToolFiles(ctx context.Context, toolCall sch
 	if codeModeServerCount == 0 {
 		responseText := "Servers are connected but none are configured for code mode. " +
 			"There are no virtual .pyi files available."
+		if serverFilter != "" {
+			responseText = fmt.Sprintf("No connected code-mode server matches '%s'. Call listToolFiles without the server filter to see all available servers.", serverFilter)
+		}
 		return createToolResponseMessage(toolCall, responseText), nil
 	}
 

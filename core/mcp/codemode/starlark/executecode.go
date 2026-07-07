@@ -133,6 +133,7 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 	// Format response text
 	var responseText string
 	var executionSuccess bool = true
+	omitEnv := s.omitEnvironmentFooter()
 	if result.Errors != nil {
 		s.logger.Debug("%s Formatting error response. Error kind: %s, Message length: %d, Hints count: %d", codemcp.CodeModeLogPrefix, result.Errors.Kind, len(result.Errors.Message), len(result.Errors.Hints))
 		logsText := ""
@@ -141,13 +142,15 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 		}
 
 		responseText = fmt.Sprintf(
-			"Execution %s error:\n\n%s\n\nHints:\n%s%s\n\nEnvironment:\n  Available server keys: %s",
+			"Execution %s error:\n\n%s\n\nHints:\n%s%s",
 			result.Errors.Kind,
 			result.Errors.Message,
 			strings.Join(result.Errors.Hints, "\n"),
 			logsText,
-			strings.Join(result.Environment.ServerKeys, ", "),
 		)
+		if !omitEnv {
+			responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s", strings.Join(result.Environment.ServerKeys, ", "))
+		}
 		s.logger.Debug("%s Error response formatted. Response length: %d chars", codemcp.CodeModeLogPrefix, len(responseText))
 	} else {
 		hasLogs := len(result.Logs) > 0
@@ -165,11 +168,12 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 			responseText = fmt.Sprintf(
 				"Execution completed but produced no data:\n\n"+
 					"The code executed without errors but returned no output (no print output and no result variable).\n\n"+
-					"Hints:\n%s\n\n"+
-					"Environment:\n  Available server keys: %s",
+					"Hints:\n%s",
 				strings.Join(hints, "\n"),
-				strings.Join(result.Environment.ServerKeys, ", "),
 			)
+			if !omitEnv {
+				responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s", strings.Join(result.Environment.ServerKeys, ", "))
+			}
 			s.logger.Debug("%s No-data failure response formatted. Response length: %d chars", codemcp.CodeModeLogPrefix, len(responseText))
 		} else {
 			if hasLogs {
@@ -188,9 +192,11 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 				}
 			}
 
-			responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s",
-				strings.Join(result.Environment.ServerKeys, ", "))
-			responseText += "\nNote: This is a Starlark (Python subset) environment. Use MCP tools for external interactions."
+			if !omitEnv {
+				responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s",
+					strings.Join(result.Environment.ServerKeys, ", "))
+				responseText += "\nNote: This is a Starlark (Python subset) environment. Use MCP tools for external interactions."
+			}
 			s.logger.Debug("%s Success response formatted. Response length: %d chars, Server keys: %v", codemcp.CodeModeLogPrefix, len(responseText), result.Environment.ServerKeys)
 		}
 	}

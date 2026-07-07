@@ -21,6 +21,7 @@ type StarlarkCodeMode struct {
 	// Configuration (atomic for thread-safe updates)
 	bindingLevel         atomic.Value // schemas.CodeModeBindingLevel
 	toolExecutionTimeout atomic.Value // time.Duration
+	omitEnvFooter        atomic.Value // bool
 
 	// Dependencies
 	clientManager         mcp.ClientManager
@@ -69,6 +70,7 @@ func NewStarlarkCodeMode(config *mcp.CodeModeConfig, logger schemas.Logger) *Sta
 	// Initialize atomic values
 	s.bindingLevel.Store(config.BindingLevel)
 	s.toolExecutionTimeout.Store(config.ToolExecutionTimeout)
+	s.omitEnvFooter.Store(config.OmitEnvironmentFooter)
 
 	s.logger.Info("%s Starlark code mode initialized with binding level: %s, timeout: %v",
 		mcp.CodeModeLogPrefix, config.BindingLevel, config.ToolExecutionTimeout)
@@ -157,6 +159,8 @@ func (s *StarlarkCodeMode) UpdateConfig(config *mcp.CodeModeConfig) {
 		s.toolExecutionTimeout.Store(config.ToolExecutionTimeout)
 	}
 
+	s.omitEnvFooter.Store(config.OmitEnvironmentFooter)
+
 	s.logger.Info("%s Starlark code mode configuration updated: binding level=%s, timeout=%v",
 		mcp.CodeModeLogPrefix, config.BindingLevel, config.ToolExecutionTimeout)
 }
@@ -168,4 +172,14 @@ func (s *StarlarkCodeMode) getToolExecutionTimeout() time.Duration {
 		return schemas.DefaultToolExecutionTimeout
 	}
 	return val.(time.Duration)
+}
+
+// omitEnvironmentFooter reports whether the trailing environment block should be
+// suppressed in executeToolCode responses (issue #4434).
+func (s *StarlarkCodeMode) omitEnvironmentFooter() bool {
+	val := s.omitEnvFooter.Load()
+	if val == nil {
+		return false
+	}
+	return val.(bool)
 }
