@@ -97,8 +97,11 @@ func ParseModelString(model string, defaultProvider ModelProvider) (ModelProvide
 	// Check if model contains a provider prefix (only split on first "/" to preserve model names with "/")
 	if strings.Contains(model, "/") {
 		parts := strings.SplitN(model, "/", 2)
-		if len(parts) == 2 && IsKnownProvider(parts[0]) {
-			return ModelProvider(parts[0]), parts[1]
+		if len(parts) == 2 {
+			provider := strings.ToLower(parts[0])
+			if IsKnownProvider(provider) {
+				return ModelProvider(provider), parts[1]
+			}
 		}
 	}
 	// No known provider prefix found, return default provider and the original model
