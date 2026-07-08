@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -952,7 +951,7 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 // clients that cap model discovery at ~10s (e.g. the omp coding agent). The
 // aggregated list only changes when providers/keys change, so it is safe to
 // cache briefly and refresh in the background. Entries are keyed by the
-// request's available provider set so per-virtual-key scoping is preserved.
+// request's virtual key so per-virtual-key scoping is preserved.
 const listAllModelsCacheTTL = 5 * time.Minute
 
 type listAllModelsCacheEntry struct {
@@ -966,28 +965,18 @@ var (
 	listAllModelsCache   = map[string]*listAllModelsCacheEntry{}
 )
 
-// availableProvidersKey derives a stable cache key from the available provider
-// set stored on the context by the virtual-key filter (empty set => "*").
-func availableProvidersKey(ctx *schemas.BifrostContext) (string, []schemas.ModelProvider) {
-	avail, _ := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
-	if len(avail) == 0 {
-		return "*", nil
-	}
-	names := make([]string, len(avail))
-	for i, p := range avail {
-		names[i] = string(p)
-	}
-	sort.Strings(names)
-	return strings.Join(names, ","), avail
-}
-
 // listAllModelsCached serves the unfiltered GET /v1/models list from a short
 // TTL cache. A stale entry is served immediately while a background refresh
 // runs; the first (cold) request blocks until the initial fill completes. The
 // refresh runs on a detached context so a client disconnect cannot abort
 // catalog population.
 func (h *CompletionHandler) listAllModelsCached(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
-	key, avail := availableProvidersKey(ctx)
+	vk, _ := ctx.Value(schemas.BifrostContextKeyVirtualKey).(string)
+	avail, _ := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
+	key := vk
+	if key == "" {
+		key = "*"
+	}
 
 	listAllModelsCacheMu.Lock()
 	entry := listAllModelsCache[key]
@@ -998,7 +987,7 @@ func (h *CompletionHandler) listAllModelsCached(ctx *schemas.BifrostContext, req
 	fresh := entry.resp != nil && time.Since(entry.at) < listAllModelsCacheTTL
 	if !fresh && entry.done == nil {
 		entry.done = make(chan struct{})
-		go h.refreshListAllModels(key, avail, entry.done)
+		go h.refreshListAllModels(key, vk, avail, entry.done)
 	}
 	cached := entry.resp
 	done := entry.done
@@ -1042,10 +1031,13 @@ func (h *CompletionHandler) listAllModelsCached(ctx *schemas.BifrostContext, req
 
 // refreshListAllModels performs the (slow) provider fan-out on a detached
 // context and stores the full result in the cache under key.
-func (h *CompletionHandler) refreshListAllModels(key string, avail []schemas.ModelProvider, done chan struct{}) {
+func (h *CompletionHandler) refreshListAllModels(key, vk string, avail []schemas.ModelProvider, done chan struct{}) {
 	defer close(done)
 
 	fillCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	if vk != "" {
+		fillCtx.SetValue(schemas.BifrostContextKeyVirtualKey, vk)
+	}
 	if len(avail) > 0 {
 		fillCtx.SetValue(schemas.BifrostContextKeyAvailableProviders, avail)
 	}
