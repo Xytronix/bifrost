@@ -13,8 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -856,7 +858,7 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 
 	// If provider is empty, list all models from all providers
 	if provider == "" {
-		resp, bifrostErr = h.client.ListAllModels(bifrostCtx, bifrostListModelsReq)
+		resp, bifrostErr = h.listAllModelsCached(bifrostCtx, bifrostListModelsReq)
 	} else {
 		resp, bifrostErr = h.client.ListModelsRequest(bifrostCtx, bifrostListModelsReq)
 	}
@@ -942,6 +944,125 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 		}
 		resp.Data[i] = modelEntry
 	}
+}
+
+// --- GET /v1/models catalog cache ---------------------------------------
+// A live provider fan-out (ListAllModels) on every unfiltered GET /v1/models
+// makes the endpoint take ~20s when many providers are configured, which trips
+// clients that cap model discovery at ~10s (e.g. the omp coding agent). The
+// aggregated list only changes when providers/keys change, so it is safe to
+// cache briefly and refresh in the background. Entries are keyed by the
+// request's available provider set so per-virtual-key scoping is preserved.
+const listAllModelsCacheTTL = 5 * time.Minute
+
+type listAllModelsCacheEntry struct {
+	resp *schemas.BifrostListModelsResponse
+	at   time.Time
+	done chan struct{} // non-nil while a refresh is in flight
+}
+
+var (
+	listAllModelsCacheMu sync.Mutex
+	listAllModelsCache   = map[string]*listAllModelsCacheEntry{}
+)
+
+// availableProvidersKey derives a stable cache key from the available provider
+// set stored on the context by the virtual-key filter (empty set => "*").
+func availableProvidersKey(ctx *schemas.BifrostContext) (string, []schemas.ModelProvider) {
+	avail, _ := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
+	if len(avail) == 0 {
+		return "*", nil
+	}
+	names := make([]string, len(avail))
+	for i, p := range avail {
+		names[i] = string(p)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ","), avail
+}
+
+// listAllModelsCached serves the unfiltered GET /v1/models list from a short
+// TTL cache. A stale entry is served immediately while a background refresh
+// runs; the first (cold) request blocks until the initial fill completes. The
+// refresh runs on a detached context so a client disconnect cannot abort
+// catalog population.
+func (h *CompletionHandler) listAllModelsCached(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	key, avail := availableProvidersKey(ctx)
+
+	listAllModelsCacheMu.Lock()
+	entry := listAllModelsCache[key]
+	if entry == nil {
+		entry = &listAllModelsCacheEntry{}
+		listAllModelsCache[key] = entry
+	}
+	fresh := entry.resp != nil && time.Since(entry.at) < listAllModelsCacheTTL
+	if !fresh && entry.done == nil {
+		entry.done = make(chan struct{})
+		go h.refreshListAllModels(key, avail, entry.done)
+	}
+	cached := entry.resp
+	done := entry.done
+	listAllModelsCacheMu.Unlock()
+
+	if cached == nil {
+		// Cold start: wait for the initial fill (or give up if the client left).
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, &schemas.BifrostError{
+				IsBifrostError: false,
+				Error:          &schemas.ErrorField{Message: "list models request cancelled"},
+				ExtraFields:    schemas.BifrostErrorExtraFields{RequestType: schemas.ListModelsRequest},
+			}
+		}
+		listAllModelsCacheMu.Lock()
+		cached = entry.resp
+		listAllModelsCacheMu.Unlock()
+		if cached == nil {
+			return nil, &schemas.BifrostError{
+				IsBifrostError: false,
+				Error:          &schemas.ErrorField{Message: "failed to list models"},
+				ExtraFields:    schemas.BifrostErrorExtraFields{RequestType: schemas.ListModelsRequest},
+			}
+		}
+	}
+
+	// Copy the requested page so downstream enrichment does not mutate the
+	// shared cached slice.
+	page := (&schemas.BifrostListModelsResponse{
+		Data:        cached.Data,
+		KeyStatuses: cached.KeyStatuses,
+		ExtraFields: cached.ExtraFields,
+	}).ApplyPagination(req.PageSize, req.PageToken)
+	models := make([]schemas.Model, len(page.Data))
+	copy(models, page.Data)
+	page.Data = models
+	return page, nil
+}
+
+// refreshListAllModels performs the (slow) provider fan-out on a detached
+// context and stores the full result in the cache under key.
+func (h *CompletionHandler) refreshListAllModels(key string, avail []schemas.ModelProvider, done chan struct{}) {
+	defer close(done)
+
+	fillCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	if len(avail) > 0 {
+		fillCtx.SetValue(schemas.BifrostContextKeyAvailableProviders, avail)
+	}
+	resp, err := h.client.ListAllModels(fillCtx, &schemas.BifrostListModelsRequest{})
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	entry := listAllModelsCache[key]
+	if entry == nil {
+		entry = &listAllModelsCacheEntry{}
+		listAllModelsCache[key] = entry
+	}
+	if err == nil && resp != nil {
+		entry.resp = resp
+		entry.at = time.Now()
+	}
+	entry.done = nil
 }
 
 // prepareTextCompletionRequest prepares a BifrostTextCompletionRequest from the HTTP request body
