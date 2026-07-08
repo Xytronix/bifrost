@@ -248,15 +248,18 @@ func (mc *ModelCatalog) GetProvidersForModel(model string) []schemas.ModelProvid
 //   - explicit allowedModels: direct or provider-prefixed match against the
 //     provider's catalog.
 func (mc *ModelCatalog) IsModelAllowedForProvider(provider schemas.ModelProvider, model string, providerConfig *configstore.ProviderConfig, allowedModels schemas.WhiteList) bool {
-	isCustomProvider := false
-	hasListModelsEndpointDisabled := false
-	if providerConfig != nil && providerConfig.CustomProviderConfig != nil {
-		isCustomProvider = true
-		hasListModelsEndpointDisabled = !providerConfig.CustomProviderConfig.IsOperationAllowed(schemas.ListModelsRequest)
-	}
+	isCustomProvider := providerConfig != nil && providerConfig.CustomProviderConfig != nil
 
 	if allowedModels.IsUnrestricted() {
-		if isCustomProvider && hasListModelsEndpointDisabled {
+		// Custom providers own their model namespace: their models come from the
+		// provider's own /v1/models (or are declared on the provider) and are not
+		// present in the bundled model catalog, so GetProvidersForModel never
+		// returns the custom provider and every model would be wrongly dropped
+		// from GET /v1/models under an unrestricted ("*") allowlist. Previously
+		// this was only short-circuited when the list_models endpoint was
+		// DISABLED, which is backwards: with list_models ENABLED the live list is
+		// exactly what should be trusted. Trust "*" for any custom provider.
+		if isCustomProvider {
 			return true
 		}
 		return slices.Contains(mc.GetProvidersForModel(model), provider)
