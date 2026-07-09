@@ -144,3 +144,86 @@ func TestApplyListModelsVirtualKeyProviderFilterSkipsInactiveVK(t *testing.T) {
 		t.Fatalf("expected inactive VK not to set available providers, got %#v", got)
 	}
 }
+
+func TestListModelsCached_KeyFormattingAndHit(t *testing.T) {
+	h := &CompletionHandler{
+		config: &lib.Config{},
+	}
+
+	// Clean/reset the cache for test isolation
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{}
+	
+	// Pre-populate cache entries
+	entry1 := &listAllModelsCacheEntry{
+		resp: &schemas.BifrostListModelsResponse{
+			Data: []schemas.Model{
+				{ID: "openai/gpt-4o"},
+			},
+		},
+		at: time.Now(),
+	}
+	listAllModelsCache["vk-1:openai:true"] = entry1
+
+	entry2 := &listAllModelsCacheEntry{
+		resp: &schemas.BifrostListModelsResponse{
+			Data: []schemas.Model{
+				{ID: "anthropic/claude-3"},
+			},
+		},
+		at: time.Now(),
+	}
+	listAllModelsCache["vk-2:*:false"] = entry2
+	listAllModelsCacheMu.Unlock()
+
+	// Case 1: vk-1, openai, unfiltered=true -> should hit entry1
+	ctx1 := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx1.SetValue(schemas.BifrostContextKeyVirtualKey, "vk-1")
+	req1 := &schemas.BifrostListModelsRequest{
+		Provider:   "openai",
+		Unfiltered: true,
+	}
+
+	resp1, err1 := h.listModelsCached(ctx1, req1)
+	if err1 != nil {
+		t.Fatalf("unexpected error: %v", err1)
+	}
+	if len(resp1.Data) != 1 || resp1.Data[0].ID != "openai/gpt-4o" {
+		t.Fatalf("expected openai/gpt-4o, got %#v", resp1.Data)
+	}
+
+	// Case 2: vk-2, no provider, unfiltered=false -> should hit entry2
+	ctx2 := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx2.SetValue(schemas.BifrostContextKeyVirtualKey, "vk-2")
+	req2 := &schemas.BifrostListModelsRequest{
+		Provider:   "",
+		Unfiltered: false,
+	}
+
+	resp2, err2 := h.listModelsCached(ctx2, req2)
+	if err2 != nil {
+		t.Fatalf("unexpected error: %v", err2)
+	}
+	if len(resp2.Data) != 1 || resp2.Data[0].ID != "anthropic/claude-3" {
+		t.Fatalf("expected anthropic/claude-3, got %#v", resp2.Data)
+	}
+
+	// Case 3: vk-1, openai, unfiltered=false -> should NOT hit entry1 (cache miss, since unfiltered differs)
+	// Since client is nil, a cache miss should attempt background refresh and block on cold start, 
+	// eventually failing/hanging or timing out. We can test this by checking that it returns error or times out,
+	// or by cancelling the context.
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	bCtx3 := schemas.NewBifrostContext(ctx3, time.Time{})
+	bCtx3.SetValue(schemas.BifrostContextKeyVirtualKey, "vk-1")
+	cancel3() // cancel immediately to fail the cold start wait
+
+	req3 := &schemas.BifrostListModelsRequest{
+		Provider:   "openai",
+		Unfiltered: false,
+	}
+
+	_, err3 := h.listModelsCached(bCtx3, req3)
+	if err3 == nil {
+		t.Fatalf("expected error on cancelled context cache miss, got nil")
+	}
+}

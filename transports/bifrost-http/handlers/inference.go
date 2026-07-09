@@ -822,8 +822,10 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, "Failed to convert context")
 		return
 	}
-	if provider == "" && !h.applyListModelsVirtualKeyProviderFilter(ctx, bifrostCtx) {
-		return
+	if provider == "" {
+		if !h.applyListModelsVirtualKeyProviderFilter(ctx, bifrostCtx) {
+			return
+		}
 	}
 
 	var resp *schemas.BifrostListModelsResponse
@@ -836,18 +838,20 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		}
 	}
 	pageToken := string(ctx.QueryArgs().Peek("page_token"))
+	unfiltered := string(ctx.QueryArgs().Peek("unfiltered")) == "true"
 
 	bifrostListModelsReq := &schemas.BifrostListModelsRequest{
-		Provider:  schemas.ModelProvider(provider),
-		PageSize:  pageSize,
-		PageToken: pageToken,
+		Provider:   schemas.ModelProvider(provider),
+		PageSize:   pageSize,
+		PageToken:  pageToken,
+		Unfiltered: unfiltered,
 	}
 
 	// Pass-through unknown query params for provider-specific features
 	extraParams := map[string]interface{}{}
 	for k, v := range ctx.QueryArgs().All() {
 		s := string(k)
-		if s != "provider" && s != "page_size" && s != "page_token" {
+		if s != "provider" && s != "page_size" && s != "page_token" && s != "unfiltered" {
 			extraParams[s] = string(v)
 		}
 	}
@@ -855,12 +859,7 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		bifrostListModelsReq.ExtraParams = extraParams
 	}
 
-	// If provider is empty, list all models from all providers
-	if provider == "" {
-		resp, bifrostErr = h.listAllModelsCached(bifrostCtx, bifrostListModelsReq)
-	} else {
-		resp, bifrostErr = h.client.ListModelsRequest(bifrostCtx, bifrostListModelsReq)
-	}
+	resp, bifrostErr = h.listModelsCached(bifrostCtx, bifrostListModelsReq)
 
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
@@ -965,18 +964,21 @@ var (
 	listAllModelsCache   = map[string]*listAllModelsCacheEntry{}
 )
 
-// listAllModelsCached serves the unfiltered GET /v1/models list from a short
+// listModelsCached serves GET /v1/models lists from a short
 // TTL cache. A stale entry is served immediately while a background refresh
 // runs; the first (cold) request blocks until the initial fill completes. The
 // refresh runs on a detached context so a client disconnect cannot abort
 // catalog population.
-func (h *CompletionHandler) listAllModelsCached(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+func (h *CompletionHandler) listModelsCached(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
 	vk, _ := ctx.Value(schemas.BifrostContextKeyVirtualKey).(string)
 	avail, _ := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
-	key := vk
-	if key == "" {
-		key = "*"
+
+	// Create a unique cache key based on virtual key, provider, and unfiltered status
+	providerKey := "*"
+	if req.Provider != "" {
+		providerKey = string(req.Provider)
 	}
+	key := fmt.Sprintf("%s:%s:%t", vk, providerKey, req.Unfiltered)
 
 	listAllModelsCacheMu.Lock()
 	entry := listAllModelsCache[key]
@@ -987,7 +989,7 @@ func (h *CompletionHandler) listAllModelsCached(ctx *schemas.BifrostContext, req
 	fresh := entry.resp != nil && time.Since(entry.at) < listAllModelsCacheTTL
 	if !fresh && entry.done == nil {
 		entry.done = make(chan struct{})
-		go h.refreshListAllModels(key, vk, avail, entry.done)
+		go h.refreshListModels(key, vk, avail, req.Provider, req.Unfiltered, entry.done)
 	}
 	cached := entry.resp
 	done := entry.done
@@ -1029,11 +1031,14 @@ func (h *CompletionHandler) listAllModelsCached(ctx *schemas.BifrostContext, req
 	return page, nil
 }
 
-// refreshListAllModels performs the (slow) provider fan-out on a detached
+// refreshListModels performs the (slow) provider fan-out or single-provider fetch on a detached
 // context and stores the full result in the cache under key.
-func (h *CompletionHandler) refreshListAllModels(key, vk string, avail []schemas.ModelProvider, done chan struct{}) {
+func (h *CompletionHandler) refreshListModels(key, vk string, avail []schemas.ModelProvider, provider schemas.ModelProvider, unfiltered bool, done chan struct{}) {
 	defer close(done)
 
+	if h.client == nil {
+		return
+	}
 	fillCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	if vk != "" {
 		fillCtx.SetValue(schemas.BifrostContextKeyVirtualKey, vk)
@@ -1041,7 +1046,19 @@ func (h *CompletionHandler) refreshListAllModels(key, vk string, avail []schemas
 	if len(avail) > 0 {
 		fillCtx.SetValue(schemas.BifrostContextKeyAvailableProviders, avail)
 	}
-	resp, err := h.client.ListAllModels(fillCtx, &schemas.BifrostListModelsRequest{})
+
+	fetchReq := &schemas.BifrostListModelsRequest{
+		Provider:   provider,
+		Unfiltered: unfiltered,
+	}
+
+	var resp *schemas.BifrostListModelsResponse
+	var err *schemas.BifrostError
+	if provider == "" {
+		resp, err = h.client.ListAllModels(fillCtx, fetchReq)
+	} else {
+		resp, err = h.client.ListModelsRequest(fillCtx, fetchReq)
+	}
 
 	listAllModelsCacheMu.Lock()
 	defer listAllModelsCacheMu.Unlock()
