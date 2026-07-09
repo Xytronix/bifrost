@@ -147,6 +147,11 @@ func (h *MCPServerHandler) handleMCPServer(ctx *fasthttp.RequestCtx) {
 
 	bifrostCtx, cancel := lib.ConvertToBifrostContext(ctx, h.config)
 	bifrostCtx.SetValue(schemas.BifrostContextKeyIsMCPGateway, true)
+	if ua := string(ctx.Request.Header.UserAgent()); ua != "" {
+		schemas.ExtractAndSetUserAgentFromHeaders(map[string][]string{
+			"User-Agent": {ua},
+		}, bifrostCtx)
+	}
 	defer cancel()
 
 	// Inject JWT identity into BifrostContext so downstream resolvers
@@ -216,6 +221,11 @@ func (h *MCPServerHandler) handleMCPServerSSE(ctx *fasthttp.RequestCtx) {
 	// Convert context
 	bifrostCtx, cancel := lib.ConvertToBifrostContext(ctx, h.config)
 	bifrostCtx.SetValue(schemas.BifrostContextKeyIsMCPGateway, true)
+	if ua := string(ctx.Request.Header.UserAgent()); ua != "" {
+		schemas.ExtractAndSetUserAgentFromHeaders(map[string][]string{
+			"User-Agent": {ua},
+		}, bifrostCtx)
+	}
 
 	if authResult.jwtClaims != nil {
 		if injErr := injectJWTContext(bifrostCtx, authResult.jwtClaims, authResult.jwtVK); injErr != nil {

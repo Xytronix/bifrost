@@ -358,7 +358,7 @@ func buildIntegrationDuplicateCheckMap(existingTools []schemas.ChatTool, integra
 				}
 			}
 		}
-	case schemas.CodexCLI.Matches(integrationUserAgent):
+	case schemas.CodexCLI.Matches(integrationUserAgent), schemas.OmpCLI.Matches(integrationUserAgent):
 		// Codex CLI uses pattern: mcp__{server_name}__{tool_name} (double underscores)
 		// but ALL hyphens in the original Bifrost tool name are converted to underscores.
 		// Strip "mcp__" then skip past the first "__" to get the all-underscore tool name.
@@ -411,7 +411,7 @@ func integrationDuplicateCheck(duplicateCheckMap map[string]bool, toolName strin
 	if duplicateCheckMap[toolName] {
 		return true
 	}
-	if schemas.CodexCLI.Matches(integrationUserAgent) && duplicateCheckMap[strings.ReplaceAll(toolName, "-", "_")] {
+	if (schemas.CodexCLI.Matches(integrationUserAgent) || schemas.OmpCLI.Matches(integrationUserAgent)) && duplicateCheckMap[strings.ReplaceAll(toolName, "-", "_")] {
 		return true
 	}
 	return false
@@ -422,7 +422,7 @@ func integrationDuplicateCheck(duplicateCheckMap map[string]bool, toolName strin
 // form so MCP-only batches cannot inject both "foo-bar" and "foo_bar".
 func markToolSeenInDuplicateCheckMap(duplicateCheckMap map[string]bool, toolName string, integrationUserAgent string) {
 	duplicateCheckMap[toolName] = true
-	if schemas.CodexCLI.Matches(integrationUserAgent) {
+	if schemas.CodexCLI.Matches(integrationUserAgent) || schemas.OmpCLI.Matches(integrationUserAgent) {
 		duplicateCheckMap[strings.ReplaceAll(toolName, "-", "_")] = true
 	}
 }

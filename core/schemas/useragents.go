@@ -11,6 +11,7 @@ var (
 	ClaudeCLI   = UserAgentIdentifiers{"claude-cli", "claude-code", "claude-vscode"}
 	GeminiCLI   = UserAgentIdentifiers{"geminicli"}
 	CodexCLI    = UserAgentIdentifiers{"codex-tui"}
+	OmpCLI      = UserAgentIdentifiers{"omp", "oh-my-pi", "pi-coding-agent"}
 	QwenCodeCLI = UserAgentIdentifiers{"qwencode"}
 	OpenCode    = UserAgentIdentifiers{"opencode"}
 	Cursor      = UserAgentIdentifiers{"cursor"}
@@ -18,7 +19,7 @@ var (
 
 // integrationUserAgents is the set of known client User-Agent patterns we persist on the context.
 var integrationUserAgents = []UserAgentIdentifiers{
-	ClaudeCLI, GeminiCLI, CodexCLI, QwenCodeCLI, OpenCode, Cursor,
+	ClaudeCLI, GeminiCLI, CodexCLI, OmpCLI, QwenCodeCLI, OpenCode, Cursor,
 }
 
 // Matches reports whether userAgent contains any identifier (case-insensitive substring match).
