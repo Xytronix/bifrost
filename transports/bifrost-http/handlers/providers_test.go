@@ -594,6 +594,48 @@ func TestEnrichListModelsResponse_MarksDeprecatedPricingRows(t *testing.T) {
 	}
 }
 
+func TestEnrichListModelsResponse_ProviderAgnosticContextFallback(t *testing.T) {
+	// "Custom Router" is a registered custom/aggregator provider (so the "/"
+	// prefix is stripped to the base model name) that is deliberately absent
+	// from the pricing catalog, exercising the provider-agnostic fallback.
+	schemas.RegisterKnownProvider("Custom Router")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("Custom Router") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"gpt-4o": {"provider":"openai","mode":"chat","base_model":"gpt-4o","max_input_tokens":128000,"max_output_tokens":16384,"input_cost_per_token":0.0000025}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "Custom Router/gpt-4o"},
+		{ID: "openai/gpt-4o"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+
+	custom := byID["Custom Router/gpt-4o"]
+	if custom.ContextLength == nil || *custom.ContextLength != 128000 {
+		t.Fatalf("custom model should borrow context length 128000 via base-model fallback, got %#v", custom.ContextLength)
+	}
+	if custom.MaxOutputTokens == nil || *custom.MaxOutputTokens != 16384 {
+		t.Fatalf("custom model should borrow max output tokens 16384 via base-model fallback, got %#v", custom.MaxOutputTokens)
+	}
+	if custom.Pricing != nil {
+		t.Fatalf("custom model fallback must be metadata-only (pricing nil), got %#v", custom.Pricing)
+	}
+
+	native := byID["openai/gpt-4o"]
+	if native.ContextLength == nil || *native.ContextLength != 128000 {
+		t.Fatalf("native model should have context length 128000 from provider match, got %#v", native.ContextLength)
+	}
+	if native.Pricing == nil {
+		t.Fatalf("native provider-matched model should have pricing enriched, got nil")
+	}
+}
+
 func TestListModels_UnfilteredIgnoresKeys(t *testing.T) {
 	SetLogger(&mockLogger{})
 
