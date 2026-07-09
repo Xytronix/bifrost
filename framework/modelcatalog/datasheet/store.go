@@ -216,6 +216,33 @@ func (s *Store) GetCapabilityEntry(model string, provider schemas.ModelProvider)
 	return nil
 }
 
+// CapabilityEntriesByBaseName returns a snapshot mapping canonical base model
+// name -> capability entry, aggregated across ALL providers. Used to enrich
+// list-models responses for custom/aggregator providers whose provider name is
+// absent from the pricing catalog but which serve well-known models (e.g. an
+// NVIDIA-hosted "deepseek-v3" or a custom router serving "claude-opus-4-6").
+// Per-base-name selection reuses the same deterministic mode preference as the
+// per-provider lookups.
+func (s *Store) CapabilityEntriesByBaseName() map[string]*Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keysByBase := make(map[string][]string)
+	for key, pricing := range s.pricingData {
+		base := s.baseModelNameUnsafe(pricing.Model)
+		if base == "" {
+			continue
+		}
+		keysByBase[base] = append(keysByBase[base], key)
+	}
+	out := make(map[string]*Entry, len(keysByBase))
+	for base, keys := range keysByBase {
+		if entry := s.selectCapabilityEntryFromKeysUnsafe(keys); entry != nil {
+			out[base] = entry
+		}
+	}
+	return out
+}
+
 // BaseModelName returns the canonical base model name. Uses the pre-computed
 // base_model from the pricing catalog when present, falling back to
 // algorithmic date/version stripping for unknown models.

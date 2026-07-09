@@ -37,6 +37,20 @@ func (mc *ModelCatalog) GetPricingEntryForModel(model string, provider schemas.M
 	return mc.datasheet.GetPricingEntryForModel(model, provider)
 }
 
+// BaseModelName returns the canonical base model name for a model string
+// (e.g. "openai/gpt-4o-2024-08-06" -> "gpt-4o").
+func (mc *ModelCatalog) BaseModelName(model string) string {
+	return mc.datasheet.BaseModelName(model)
+}
+
+// CapabilityEntriesByBaseName returns capability metadata indexed by canonical
+// base model name, aggregated across all providers. Used to enrich list-models
+// responses for custom/aggregator providers whose provider name is absent from
+// the pricing catalog but which serve well-known models.
+func (mc *ModelCatalog) CapabilityEntriesByBaseName() map[string]*PricingEntry {
+	return mc.datasheet.CapabilityEntriesByBaseName()
+}
+
 // CalculateCost computes the dollar cost for a Bifrost response.
 func (mc *ModelCatalog) CalculateCost(result *schemas.BifrostResponse, scopes *PricingLookupScopes) float64 {
 	return mc.datasheet.CalculateCost(result, (*datasheet.LookupScopes)(scopes))

@@ -888,6 +888,13 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 		return
 	}
 
+	// anyProviderIdx holds capability metadata keyed by canonical base model
+	// name across ALL providers, built lazily on the first model that misses
+	// the provider-scoped pricing lookup. Fallback for custom/aggregator
+	// providers (NVIDIA, Opera, custom routers) whose provider name is not in
+	// the pricing catalog but which serve well-known models.
+	var anyProviderIdx map[string]*modelcatalog.PricingEntry
+
 	for i := range resp.Data {
 		modelEntry := resp.Data[i]
 		provider, modelName := schemas.ParseModelString(modelEntry.ID, "")
@@ -938,6 +945,36 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 					pricing.WebSearch = bifrost.Ptr(fmt.Sprintf("%.10f", *pricingEntry.SearchContextCostPerQuery))
 				}
 				modelEntry.Pricing = pricing
+			}
+		}
+		// Provider-agnostic metadata fallback: when the (model, provider)
+		// lookup found no context window (typical for custom/aggregator
+		// providers), borrow it from any catalog entry sharing the same base
+		// model name. Metadata only — pricing is intentionally NOT copied
+		// because a custom route's cost need not match the canonical provider.
+		if modelEntry.ContextLength == nil {
+			if anyProviderIdx == nil {
+				anyProviderIdx = catalog.CapabilityEntriesByBaseName()
+			}
+			fallback := anyProviderIdx[catalog.BaseModelName(modelName)]
+			if fallback == nil && modelEntry.Alias != nil {
+				fallback = anyProviderIdx[catalog.BaseModelName(*modelEntry.Alias)]
+			}
+			if fallback != nil {
+				if fallback.ContextLength != nil {
+					modelEntry.ContextLength = fallback.ContextLength
+				} else if fallback.MaxInputTokens != nil {
+					modelEntry.ContextLength = fallback.MaxInputTokens
+				}
+				if fallback.MaxInputTokens != nil && modelEntry.MaxInputTokens == nil {
+					modelEntry.MaxInputTokens = fallback.MaxInputTokens
+				}
+				if fallback.MaxOutputTokens != nil && modelEntry.MaxOutputTokens == nil {
+					modelEntry.MaxOutputTokens = fallback.MaxOutputTokens
+				}
+				if fallback.Architecture != nil && modelEntry.Architecture == nil {
+					modelEntry.Architecture = fallback.Architecture
+				}
 			}
 		}
 		resp.Data[i] = modelEntry
