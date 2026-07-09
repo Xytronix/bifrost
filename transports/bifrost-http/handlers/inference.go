@@ -940,11 +940,6 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 				modelEntry.Pricing = pricing
 			}
 		}
-		if string(provider) == "Opera" {
-			limit := 640
-			modelEntry.ContextLength = &limit
-			modelEntry.MaxInputTokens = &limit
-		}
 		resp.Data[i] = modelEntry
 	}
 }
