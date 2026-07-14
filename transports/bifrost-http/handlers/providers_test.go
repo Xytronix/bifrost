@@ -668,6 +668,29 @@ func TestEnrichListModelsResponse_StripsEffortMarkerForFallbackPricing(t *testin
 	}
 }
 
+func TestEnrichListModelsResponse_StripsInnerOrgPrefixForFallbackPricing(t *testing.T) {
+	// An NVIDIA-style provider/org/model id resolves to the aggregated base
+	// entry by dropping the inner org prefix
+	// ("meta/llama-3.1-70b-instruct" -> "llama-3.1-70b-instruct"). Dynamic.
+	schemas.RegisterKnownProvider("NVIDIA")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("NVIDIA") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"llama-3.1-70b-instruct": {"provider":"deepinfra","mode":"chat","base_model":"llama-3.1-70b-instruct","max_input_tokens":131072,"input_cost_per_token":0.0000004,"output_cost_per_token":0.0000004}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "NVIDIA/meta/llama-3.1-70b-instruct"},
+	}}
+	enrichListModelsResponse(resp, catalog)
+	m := resp.Data[0]
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("inner-org model should borrow base-model pricing via last-segment fallback, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000004000" {
+		t.Fatalf("prompt price should match llama-3.1-70b-instruct (0.0000004000), got %q", *m.Pricing.Prompt)
+	}
+}
+
 func TestListModels_UnfilteredIgnoresKeys(t *testing.T) {
 	SetLogger(&mockLogger{})
 

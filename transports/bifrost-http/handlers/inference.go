@@ -1003,17 +1003,38 @@ func stripTrailingModelMarkers(model string) string {
 }
 
 // fallbackEntryForModel resolves a custom/aggregator model to a base-name
-// capability+pricing entry: first by its canonical base model, then by the base
-// model of its marker-stripped form (so "Opera/claude-fable-5-low" resolves to
-// "claude-fable-5"). Dynamic — no per-model overrides.
+// capability+pricing entry. Tries progressively less-specific forms: as
+// reported, marker-stripped ("Opera/claude-fable-5-low" -> "claude-fable-5"),
+// and with the inner org prefix dropped ("meta/llama-3.1-70b-instruct" ->
+// "llama-3.1-70b-instruct") so NVIDIA-style provider/org/model ids resolve to
+// the aggregated base entry. Dynamic — no per-model overrides.
 func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *modelcatalog.ModelCatalog, model string) *modelcatalog.PricingEntry {
-	if e := idx[catalog.BaseModelName(model)]; e != nil {
-		return e
-	}
-	if stripped := stripTrailingModelMarkers(model); stripped != model {
-		return idx[catalog.BaseModelName(stripped)]
+	seen := map[string]bool{}
+	for _, cand := range []string{
+		model,
+		stripTrailingModelMarkers(model),
+		lastPathSegment(model),
+		stripTrailingModelMarkers(lastPathSegment(model)),
+	} {
+		base := catalog.BaseModelName(cand)
+		if base == "" || seen[base] {
+			continue
+		}
+		seen[base] = true
+		if e := idx[base]; e != nil {
+			return e
+		}
 	}
 	return nil
+}
+
+// lastPathSegment returns the substring after the final "/", dropping an inner
+// org/namespace prefix ("meta/llama-3.1-70b-instruct" -> "llama-3.1-70b-instruct").
+func lastPathSegment(model string) string {
+	if i := strings.LastIndex(model, "/"); i >= 0 && i+1 < len(model) {
+		return model[i+1:]
+	}
+	return model
 }
 
 // pricingFromEntry builds a /v1/models Pricing block from a catalog entry's
