@@ -925,40 +925,22 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 				modelEntry.Architecture = pricingEntry.Architecture
 			}
 			if modelEntry.Pricing == nil {
-				pricing := &schemas.Pricing{}
-				if pricingEntry.InputCostPerToken != nil {
-					pricing.Prompt = bifrost.Ptr(fmt.Sprintf("%.10f", *pricingEntry.InputCostPerToken))
-				}
-				if pricingEntry.OutputCostPerToken != nil {
-					pricing.Completion = bifrost.Ptr(fmt.Sprintf("%.10f", *pricingEntry.OutputCostPerToken))
-				}
-				if pricingEntry.InputCostPerImage != nil {
-					pricing.Image = bifrost.Ptr(fmt.Sprintf("%.10f", *pricingEntry.InputCostPerImage))
-				}
-				if pricingEntry.CacheReadInputTokenCost != nil {
-					pricing.InputCacheRead = bifrost.Ptr(fmt.Sprintf("%.10f", *pricingEntry.CacheReadInputTokenCost))
-				}
-				if pricingEntry.CacheCreationInputTokenCost != nil {
-					pricing.InputCacheWrite = bifrost.Ptr(fmt.Sprintf("%.10f", *pricingEntry.CacheCreationInputTokenCost))
-				}
-				if pricingEntry.SearchContextCostPerQuery != nil {
-					pricing.WebSearch = bifrost.Ptr(fmt.Sprintf("%.10f", *pricingEntry.SearchContextCostPerQuery))
-				}
-				modelEntry.Pricing = pricing
+				modelEntry.Pricing = pricingFromEntry(pricingEntry)
 			}
 		}
-		// Provider-agnostic metadata fallback: when the (model, provider)
-		// lookup found no context window (typical for custom/aggregator
-		// providers), borrow it from any catalog entry sharing the same base
-		// model name. Metadata only — pricing is intentionally NOT copied
-		// because a custom route's cost need not match the canonical provider.
+		// Provider-agnostic fallback: when the (model, provider) lookup found
+		// no context window (typical for custom/aggregator providers), borrow
+		// capability metadata AND base-model pricing from any catalog entry
+		// sharing the same base model name. Custom routes usually resell the
+		// canonical model at ~canonical rates, so the pricing is a best-effort
+		// estimate consumers (omp, agentsview) can surface instead of $0.
 		if modelEntry.ContextLength == nil {
 			if anyProviderIdx == nil {
 				anyProviderIdx = catalog.CapabilityEntriesByBaseName()
 			}
-			fallback := anyProviderIdx[catalog.BaseModelName(modelName)]
+			fallback := fallbackEntryForModel(anyProviderIdx, catalog, modelName)
 			if fallback == nil && modelEntry.Alias != nil {
-				fallback = anyProviderIdx[catalog.BaseModelName(*modelEntry.Alias)]
+				fallback = fallbackEntryForModel(anyProviderIdx, catalog, *modelEntry.Alias)
 			}
 			if fallback != nil {
 				if fallback.ContextLength != nil {
@@ -975,10 +957,101 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 				if fallback.Architecture != nil && modelEntry.Architecture == nil {
 					modelEntry.Architecture = fallback.Architecture
 				}
+				if modelEntry.Pricing == nil {
+					modelEntry.Pricing = pricingFromEntry(fallback)
+				}
 			}
 		}
 		resp.Data[i] = modelEntry
 	}
+}
+
+// trailingPricingMarkers are identity-preserving suffixes a reseller or
+// aggregator appends to a model id (effort/quant/routing) that do not change
+// the underlying model's pricing. Mirrors omp's marker vocabulary; "search" is
+// excluded because it can denote a distinct model (e.g. sonar-pro-search).
+var trailingPricingMarkers = []string{
+	"thinking", "customtools", "high", "low", "medium", "minimal", "xhigh",
+	"free", "cloud", "exacto", "nitro", "original", "optimized",
+	"nvfp4", "fp8", "fp4", "bf16", "int8", "int4",
+}
+
+// stripTrailingModelMarkers peels one or more trailing identity-preserving
+// markers ("claude-fable-5-low" -> "claude-fable-5") so an aggregator alias
+// resolves to its base model. Returns the input unchanged when it has none.
+func stripTrailingModelMarkers(model string) string {
+	for {
+		trimmed := strings.TrimRight(model, " ")
+		next := trimmed
+		for _, m := range trailingPricingMarkers {
+			for _, sep := range []string{"-", ":"} {
+				suffix := sep + m
+				if len(trimmed) > len(suffix) && strings.EqualFold(trimmed[len(trimmed)-len(suffix):], suffix) {
+					next = trimmed[:len(trimmed)-len(suffix)]
+					break
+				}
+			}
+			if next != trimmed {
+				break
+			}
+		}
+		if next == trimmed {
+			return next
+		}
+		model = next
+	}
+}
+
+// fallbackEntryForModel resolves a custom/aggregator model to a base-name
+// capability+pricing entry: first by its canonical base model, then by the base
+// model of its marker-stripped form (so "Opera/claude-fable-5-low" resolves to
+// "claude-fable-5"). Dynamic — no per-model overrides.
+func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *modelcatalog.ModelCatalog, model string) *modelcatalog.PricingEntry {
+	if e := idx[catalog.BaseModelName(model)]; e != nil {
+		return e
+	}
+	if stripped := stripTrailingModelMarkers(model); stripped != model {
+		return idx[catalog.BaseModelName(stripped)]
+	}
+	return nil
+}
+
+// pricingFromEntry builds a /v1/models Pricing block from a catalog entry's
+// cost fields, returning nil when the entry carries no cost.
+func pricingFromEntry(e *modelcatalog.PricingEntry) *schemas.Pricing {
+	if e == nil {
+		return nil
+	}
+	p := &schemas.Pricing{}
+	set := false
+	if e.InputCostPerToken != nil {
+		p.Prompt = bifrost.Ptr(fmt.Sprintf("%.10f", *e.InputCostPerToken))
+		set = true
+	}
+	if e.OutputCostPerToken != nil {
+		p.Completion = bifrost.Ptr(fmt.Sprintf("%.10f", *e.OutputCostPerToken))
+		set = true
+	}
+	if e.InputCostPerImage != nil {
+		p.Image = bifrost.Ptr(fmt.Sprintf("%.10f", *e.InputCostPerImage))
+		set = true
+	}
+	if e.CacheReadInputTokenCost != nil {
+		p.InputCacheRead = bifrost.Ptr(fmt.Sprintf("%.10f", *e.CacheReadInputTokenCost))
+		set = true
+	}
+	if e.CacheCreationInputTokenCost != nil {
+		p.InputCacheWrite = bifrost.Ptr(fmt.Sprintf("%.10f", *e.CacheCreationInputTokenCost))
+		set = true
+	}
+	if e.SearchContextCostPerQuery != nil {
+		p.WebSearch = bifrost.Ptr(fmt.Sprintf("%.10f", *e.SearchContextCostPerQuery))
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return p
 }
 
 // --- GET /v1/models catalog cache ---------------------------------------

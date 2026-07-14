@@ -594,10 +594,11 @@ func TestEnrichListModelsResponse_MarksDeprecatedPricingRows(t *testing.T) {
 	}
 }
 
-func TestEnrichListModelsResponse_ProviderAgnosticContextFallback(t *testing.T) {
+func TestEnrichListModelsResponse_ProviderAgnosticContextAndPricingFallback(t *testing.T) {
 	// "Custom Router" is a registered custom/aggregator provider (so the "/"
 	// prefix is stripped to the base model name) that is deliberately absent
-	// from the pricing catalog, exercising the provider-agnostic fallback.
+	// from the pricing catalog, exercising the provider-agnostic fallback for
+	// both capability metadata and base-model pricing.
 	schemas.RegisterKnownProvider("Custom Router")
 	t.Cleanup(func() { schemas.UnregisterKnownProvider("Custom Router") })
 
@@ -623,8 +624,11 @@ func TestEnrichListModelsResponse_ProviderAgnosticContextFallback(t *testing.T) 
 	if custom.MaxOutputTokens == nil || *custom.MaxOutputTokens != 16384 {
 		t.Fatalf("custom model should borrow max output tokens 16384 via base-model fallback, got %#v", custom.MaxOutputTokens)
 	}
-	if custom.Pricing != nil {
-		t.Fatalf("custom model fallback must be metadata-only (pricing nil), got %#v", custom.Pricing)
+	if custom.Pricing == nil || custom.Pricing.Prompt == nil {
+		t.Fatalf("custom model should borrow base-model pricing via fallback, got %#v", custom.Pricing)
+	}
+	if *custom.Pricing.Prompt != "0.0000025000" {
+		t.Fatalf("custom model prompt price should match base gpt-4o (0.0000025000), got %q", *custom.Pricing.Prompt)
 	}
 
 	native := byID["openai/gpt-4o"]
@@ -633,6 +637,34 @@ func TestEnrichListModelsResponse_ProviderAgnosticContextFallback(t *testing.T) 
 	}
 	if native.Pricing == nil {
 		t.Fatalf("native provider-matched model should have pricing enriched, got nil")
+	}
+}
+
+func TestEnrichListModelsResponse_StripsEffortMarkerForFallbackPricing(t *testing.T) {
+	// A custom/aggregator provider serving an effort-suffixed alias
+	// ("claude-fable-5-low") resolves to the base model's context AND pricing by
+	// stripping the identity-preserving marker — dynamically, no per-model override.
+	schemas.RegisterKnownProvider("Opera")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("Opera") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"claude-fable-5": {"provider":"anthropic","mode":"chat","base_model":"claude-fable-5","max_input_tokens":200000,"max_output_tokens":64000,"input_cost_per_token":0.00001,"output_cost_per_token":0.00005}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "Opera/claude-fable-5-low"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	m := resp.Data[0]
+	if m.ContextLength == nil || *m.ContextLength != 200000 {
+		t.Fatalf("effort alias should borrow context 200000 via marker-stripped base, got %#v", m.ContextLength)
+	}
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("effort alias should borrow base-model pricing, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000100000" {
+		t.Fatalf("prompt price should match claude-fable-5 (0.0000100000), got %q", *m.Pricing.Prompt)
 	}
 }
 
