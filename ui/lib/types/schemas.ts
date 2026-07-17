@@ -116,6 +116,7 @@ export const vertexKeyConfigSchema = z
 		project_number: secretVarSchema.optional(),
 		region: secretVarSchema.optional(),
 		auth_credentials: secretVarSchema.optional(),
+		force_single_region: z.boolean().optional(),
 	})
 	.refine((data) => isSecretVarSet(data.project_id), {
 		message: "Project ID is required",
@@ -162,6 +163,7 @@ export const bedrockKeyConfigSchema = z
 		external_id: secretVarSchema.optional(),
 		session_name: secretVarSchema.optional(),
 		arn: secretVarSchema.optional(),
+		project_id: secretVarSchema.optional(),
 		batch_s3_config: batchS3ConfigSchema.optional(),
 	})
 	.refine(
@@ -203,6 +205,7 @@ export const bedrockMantleKeyConfigSchema = z
 		role_arn: secretVarSchema.optional(),
 		external_id: secretVarSchema.optional(),
 		session_name: secretVarSchema.optional(),
+		project_id: secretVarSchema.optional(),
 	})
 	.refine((data) => isSecretVarSet(data.region), {
 		message: "Region is required",
@@ -290,9 +293,11 @@ const aliasConfigObjectSchema = z.object({
 	api_version: z.string().optional(),
 	anthropic_version: z.string().optional(),
 	endpoint: secretVarSchema.optional(),
-	// Vertex overrides
+	// Shared per-alias project override (Vertex / Bedrock / Bedrock Mantle)
 	project_id: secretVarSchema.optional(),
+	// Vertex overrides
 	project_number: secretVarSchema.optional(),
+	force_single_region: z.boolean().optional(),
 	// Bedrock overrides
 	inference_profile_arn: secretVarSchema.optional(),
 	// Replicate overrides
@@ -409,6 +414,12 @@ export const networkConfigSchema = z
 			.min(5, "Stream idle timeout must be at least 5 seconds")
 			.max(3600, "Stream idle timeout must be at most 3600 seconds i.e. 60 minutes")
 			.optional(),
+		keep_alive_timeout_in_seconds: z
+			.number()
+			.int("Keep-alive timeout must be a whole number of seconds")
+			.min(1, "Keep-alive timeout must be at least 1 second")
+			.max(3600, "Keep-alive timeout must be at most 3600 seconds i.e. 60 minutes")
+			.optional(),
 		max_conns_per_host: z
 			.number()
 			.int("Max connections must be a whole number")
@@ -461,6 +472,12 @@ export const networkFormConfigSchema = z
 			.int("Stream idle timeout must be a whole number of seconds")
 			.min(5, "Stream idle timeout must be at least 5 seconds")
 			.max(3600, "Stream idle timeout must be at most 3600 seconds i.e. 60 minutes")
+			.optional(),
+		keep_alive_timeout_in_seconds: z.coerce
+			.number("Keep-alive timeout must be a number")
+			.int("Keep-alive timeout must be a whole number of seconds")
+			.min(1, "Keep-alive timeout must be at least 1 second")
+			.max(3600, "Keep-alive timeout must be at most 3600 seconds i.e. 60 minutes")
 			.optional(),
 		max_conns_per_host: z.coerce
 			.number("Max connections must be a number")

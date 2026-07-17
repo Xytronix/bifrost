@@ -471,8 +471,8 @@ func (h *GovernanceHandler) reconcileModelConfigBudgets(ctx context.Context, tx 
 		if b.MaxLimit < 0 {
 			return &badRequestError{err: fmt.Errorf("budget max_limit cannot be negative: %.2f", b.MaxLimit)}
 		}
-		if _, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil {
-			return &badRequestError{err: fmt.Errorf("invalid reset duration format: %s", b.ResetDuration)}
+		if d, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil || d <= 0 {
+			return &badRequestError{err: fmt.Errorf("invalid reset duration (must be a positive duration): %s", b.ResetDuration)}
 		}
 		if seenDurations[b.ResetDuration] {
 			return &badRequestError{err: fmt.Errorf("duplicate reset_duration in budgets: %s", b.ResetDuration)}
@@ -539,8 +539,8 @@ func (h *GovernanceHandler) reconcileCustomerBudgets(ctx context.Context, tx *go
 		if b.MaxLimit < 0 {
 			return &badRequestError{err: fmt.Errorf("budget max_limit cannot be negative: %.2f", b.MaxLimit)}
 		}
-		if _, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil {
-			return &badRequestError{err: fmt.Errorf("invalid reset duration format: %s", b.ResetDuration)}
+		if d, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil || d <= 0 {
+			return &badRequestError{err: fmt.Errorf("invalid reset duration (must be a positive duration): %s", b.ResetDuration)}
 		}
 		if seenDurations[b.ResetDuration] {
 			return &badRequestError{err: fmt.Errorf("duplicate reset_duration in budgets: %s", b.ResetDuration)}
@@ -1284,8 +1284,8 @@ func (h *GovernanceHandler) createVirtualKey(ctx *fasthttp.RequestCtx) {
 				SendError(ctx, 400, fmt.Sprintf("Budget max_limit cannot be negative: %.2f", b.MaxLimit))
 				return
 			}
-			if _, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil {
-				SendError(ctx, 400, fmt.Sprintf("Invalid reset duration format: %s", b.ResetDuration))
+			if d, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil || d <= 0 {
+				SendError(ctx, 400, fmt.Sprintf("Invalid reset duration (must be a positive duration): %s", b.ResetDuration))
 				return
 			}
 			if seenDurations[b.ResetDuration] {
@@ -2192,8 +2192,8 @@ func (h *GovernanceHandler) createTeam(ctx *fasthttp.RequestCtx) {
 			if b.MaxLimit < 0 {
 				return &badRequestError{err: fmt.Errorf("budget max_limit cannot be negative: %.2f", b.MaxLimit)}
 			}
-			if _, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil {
-				return &badRequestError{err: fmt.Errorf("invalid reset duration format: %s", b.ResetDuration)}
+			if d, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil || d <= 0 {
+				return &badRequestError{err: fmt.Errorf("invalid reset duration (must be a positive duration): %s", b.ResetDuration)}
 			}
 			if seenDurations[b.ResetDuration] {
 				return &badRequestError{err: fmt.Errorf("duplicate reset_duration in budgets: %s", b.ResetDuration)}
@@ -2328,8 +2328,8 @@ func (h *GovernanceHandler) updateTeam(ctx *fasthttp.RequestCtx) {
 				if b.MaxLimit < 0 {
 					return &badRequestError{err: fmt.Errorf("budget max_limit cannot be negative: %.2f", b.MaxLimit)}
 				}
-				if _, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil {
-					return &badRequestError{err: fmt.Errorf("invalid reset duration format: %s", b.ResetDuration)}
+				if d, err := configstoreTables.ParseDuration(b.ResetDuration); err != nil || d <= 0 {
+					return &badRequestError{err: fmt.Errorf("invalid reset duration (must be a positive duration): %s", b.ResetDuration)}
 				}
 				if seenDurations[b.ResetDuration] {
 					return &badRequestError{err: fmt.Errorf("duplicate reset_duration in budgets: %s", b.ResetDuration)}
@@ -2949,8 +2949,8 @@ func validateRateLimit(rateLimit *configstoreTables.TableRateLimit) error {
 		if rateLimit.TokenResetDuration == nil {
 			return fmt.Errorf("rate limit token reset duration is required")
 		}
-		if _, err := configstoreTables.ParseDuration(*rateLimit.TokenResetDuration); err != nil {
-			return fmt.Errorf("invalid rate limit token reset duration format: %s", *rateLimit.TokenResetDuration)
+		if d, err := configstoreTables.ParseDuration(*rateLimit.TokenResetDuration); err != nil || d <= 0 {
+			return fmt.Errorf("invalid rate limit token reset duration (must be a positive duration): %s", *rateLimit.TokenResetDuration)
 		}
 	}
 	if rateLimit.RequestMaxLimit != nil && (*rateLimit.RequestMaxLimit < 0 || *rateLimit.RequestMaxLimit == 0) {
@@ -2961,8 +2961,8 @@ func validateRateLimit(rateLimit *configstoreTables.TableRateLimit) error {
 		if rateLimit.RequestResetDuration == nil {
 			return fmt.Errorf("rate limit request reset duration is required")
 		}
-		if _, err := configstoreTables.ParseDuration(*rateLimit.RequestResetDuration); err != nil {
-			return fmt.Errorf("invalid rate limit request reset duration format: %s", *rateLimit.RequestResetDuration)
+		if d, err := configstoreTables.ParseDuration(*rateLimit.RequestResetDuration); err != nil || d <= 0 {
+			return fmt.Errorf("invalid rate limit request reset duration (must be a positive duration): %s", *rateLimit.RequestResetDuration)
 		}
 	}
 	return nil
@@ -2992,8 +2992,8 @@ func validateBudget(budget *configstoreTables.TableBudget) error {
 	if budget.ResetDuration == "" {
 		return fmt.Errorf("budget reset duration is required")
 	}
-	if _, err := configstoreTables.ParseDuration(budget.ResetDuration); err != nil {
-		return fmt.Errorf("invalid budget reset duration format: %s", budget.ResetDuration)
+	if d, err := configstoreTables.ParseDuration(budget.ResetDuration); err != nil || d <= 0 {
+		return fmt.Errorf("invalid budget reset duration (must be a positive duration): %s", budget.ResetDuration)
 	}
 	return nil
 }
@@ -3278,8 +3278,8 @@ func (h *GovernanceHandler) createModelConfig(ctx *fasthttp.RequestCtx) {
 			SendError(ctx, 400, fmt.Sprintf("Budget max_limit cannot be negative: %.2f", req.Budgets[i].MaxLimit))
 			return
 		}
-		if _, err := configstoreTables.ParseDuration(req.Budgets[i].ResetDuration); err != nil {
-			SendError(ctx, 400, fmt.Sprintf("Invalid reset duration format: %s", req.Budgets[i].ResetDuration))
+		if d, err := configstoreTables.ParseDuration(req.Budgets[i].ResetDuration); err != nil || d <= 0 {
+			SendError(ctx, 400, fmt.Sprintf("Invalid reset duration (must be a positive duration): %s", req.Budgets[i].ResetDuration))
 			return
 		}
 		if seenDurations[req.Budgets[i].ResetDuration] {
@@ -4004,6 +4004,11 @@ func (h *GovernanceHandler) createRoutingRule(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, 400, err.Error())
 		return
 	}
+	// Reject malformed CEL at write time instead of it silently failing at first evaluation.
+	if err := governance.ValidateRoutingCELExpression(req.CelExpression); err != nil {
+		SendError(ctx, 400, fmt.Sprintf("invalid CEL expression: %s", err.Error()))
+		return
+	}
 
 	// Set defaults and normalize scope/scope_id
 	scope := req.Scope
@@ -4116,6 +4121,12 @@ func (h *GovernanceHandler) updateRoutingRule(ctx *fasthttp.RequestCtx) {
 		rule.ChainRule = *req.ChainRule
 	}
 	if req.CelExpression != nil {
+		// Validate only when the field is supplied, so unrelated updates (e.g. toggling
+		// enabled) never start failing on a pre-existing malformed expression.
+		if err := governance.ValidateRoutingCELExpression(*req.CelExpression); err != nil {
+			SendError(ctx, 400, fmt.Sprintf("invalid CEL expression: %s", err.Error()))
+			return
+		}
 		rule.CelExpression = *req.CelExpression
 	}
 	if req.Targets != nil {
@@ -4780,7 +4791,7 @@ func (h *GovernanceHandler) getVirtualKeyQuota(ctx *fasthttp.RequestCtx) {
 		vkValue = *v
 	}
 	if vkValue == "" {
-		SendError(ctx, 401, "Missing virtual key. Provide it via x-bf-vk header, Authorization Bearer, x-api-key, or x-goog-api-key header.")
+		SendError(ctx, 401, "Missing virtual key. Provide it via x-bf-vk header, Authorization Bearer, x-api-key, x-goog-api-key, or api-key header.")
 		return
 	}
 

@@ -4,8 +4,9 @@ package logstore
 // Postgres (raw path, no matviews), and ClickHouse, runs every LogStore
 // interface method on all three, and asserts that the non-reference backends
 // return results equal to Postgres (the reference). This is the executable
-// form of "every backend is 100% compatible": all 60 interface methods are
-// exercised - reads, writes, mutations, async jobs, and deletes - including
+// form of "every backend is 100% compatible": every interface method is
+// exercised - reads, writes, mutations, async jobs, webhook deliveries, and
+// deletes - including
 // every dialect branch in rdb.go (metadata JSON, cache-hit extraction,
 // histogram bucket math, routing-engine matching, distinct queries) and the
 // DAC queryscope path.
@@ -36,6 +37,7 @@ import (
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/queryscope"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,6 +64,7 @@ func parityBackends(t *testing.T) map[string]LogStore {
 	dropAllManagedMatViews(db)
 	require.NoError(t, db.Exec("DROP TABLE IF EXISTS mcp_tool_logs CASCADE").Error)
 	require.NoError(t, db.Exec("DROP TABLE IF EXISTS async_jobs CASCADE").Error)
+	require.NoError(t, db.Exec("DROP TABLE IF EXISTS webhook_deliveries CASCADE").Error)
 	require.NoError(t, db.Exec("DROP TABLE IF EXISTS logs CASCADE").Error)
 	require.NoError(t, db.Exec("CREATE TABLE IF NOT EXISTS migrations (id VARCHAR(255) PRIMARY KEY)").Error)
 	require.NoError(t, db.Exec("DELETE FROM migrations").Error)
@@ -92,6 +95,7 @@ type parityLogSpec struct {
 	model        string
 	status       string
 	alias        *string
+	canonical    *string
 	selectedKey  string
 	vkID, vkName *string
 	teamID       *string
@@ -122,6 +126,7 @@ func (s parityLogSpec) toLog(base time.Time) *Log {
 		Model:                 s.model,
 		Status:                s.status,
 		Alias:                 s.alias,
+		CanonicalModelName:    s.canonical,
 		SelectedKeyID:         s.selectedKey,
 		VirtualKeyID:          s.vkID,
 		VirtualKeyName:        s.vkName,
@@ -150,7 +155,7 @@ func (s parityLogSpec) toLog(base time.Time) *Log {
 func paritySpecs() []parityLogSpec {
 	return []parityLogSpec{
 		{id: "p1", offsetSec: 100, object: "chat.completion", provider: "openai", model: "gpt-4o", status: "success",
-			alias: strPtrP("a1"), selectedKey: "sk1", vkID: strPtrP("vk1"), vkName: strPtrP("VK One"),
+			alias: strPtrP("a1"), canonical: strPtrP("gpt-4o-2024-11-20"), selectedKey: "sk1", vkID: strPtrP("vk1"), vkName: strPtrP("VK One"),
 			teamID: strPtrP("t1"), customerID: strPtrP("c1"), buID: strPtrP("b1"), userID: strPtrP("u1"),
 			cost: f64PtrP(0.5), latency: f64PtrP(100), tokens: [3]int{100, 50, 150}, stopReason: strPtrP("stop"),
 			routing: strPtrP("governance,loadbalancing"), metadata: strPtrP(`{"env":"prod"}`),
@@ -172,7 +177,7 @@ func paritySpecs() []parityLogSpec {
 		{id: "p6", offsetSec: 50, object: "embedding", provider: "openai", model: "gpt-4o", status: "success",
 			cost: f64PtrP(0), latency: f64PtrP(75), tokens: [3]int{10, 5, 15}},
 		{id: "p7", offsetSec: 40, object: "chat.completion", provider: "mistral", model: "mistral-small", status: "success",
-			alias: strPtrP("a2"), vkID: strPtrP("vk3"), vkName: strPtrP("VK Three"), customerID: strPtrP("c2"),
+			alias: strPtrP("a2"), canonical: strPtrP("mistral-small-2409"), vkID: strPtrP("vk3"), vkName: strPtrP("VK Three"), customerID: strPtrP("c2"),
 			buID: strPtrP("b2"), userID: strPtrP("u4"), cost: f64PtrP(3.0), latency: f64PtrP(800),
 			tokens: [3]int{900, 100, 1000}, stopReason: strPtrP("stop"), content: "golf hotel"},
 		{id: "p8", offsetSec: 30, object: "chat.completion", provider: "openai", model: "gpt-4o", status: "success",
@@ -425,6 +430,27 @@ func asyncJobProjection(j *AsyncJob) map[string]any {
 	return out
 }
 
+func webhookDeliveryProjection(d *WebhookDelivery) map[string]any {
+	out := map[string]any{
+		"id": d.ID, "webhook_id": d.WebhookID, "endpoint_id": d.EndpointID,
+		"async_job_id": d.AsyncJobID, "event": d.Event, "attempt_no": d.AttemptNo,
+		"outcome": d.Outcome, "status_code": d.StatusCode, "error": d.Error,
+		"created_ms": d.CreatedAt.UnixMilli(),
+	}
+	if d.ExpiresAt != nil {
+		out["expires_ms"] = d.ExpiresAt.UnixMilli()
+	}
+	return out
+}
+
+func webhookDeliverySearchProjection(r *WebhookDeliverySearchResult) any {
+	deliveries := make([]map[string]any, 0, len(r.Deliveries))
+	for _, d := range r.Deliveries {
+		deliveries = append(deliveries, webhookDeliveryProjection(&d))
+	}
+	return map[string]any{"total": r.Pagination.TotalCount, "deliveries": deliveries}
+}
+
 // remainingLogIDs lists surviving log ids - the post-state assertion used
 // after every destructive operation.
 func remainingLogIDs(ctx context.Context, s LogStore) (any, error) {
@@ -571,6 +597,12 @@ func TestLogStoreParity(t *testing.T) {
 		},
 		"provider_latency": func(ctx context.Context, s LogStore) (any, error) {
 			return s.GetProviderLatencyHistogram(ctx, window, 60)
+		},
+		"throughput": func(ctx context.Context, s LogStore) (any, error) {
+			return s.GetThroughputHistogram(ctx, window, 60)
+		},
+		"provider_throughput": func(ctx context.Context, s LogStore) (any, error) {
+			return s.GetProviderThroughputHistogram(ctx, window, 60)
 		},
 		"dimension_cost": func(ctx context.Context, s LogStore) (any, error) {
 			return s.GetDimensionCostHistogram(ctx, window, 60, DimensionProvider)
@@ -1028,6 +1060,70 @@ func TestLogStoreParity(t *testing.T) {
 		// Expired cleanup removes j2 with the same count everywhere.
 		assertParity(t, stores, 1e-6, func(ctx context.Context, s LogStore) (any, error) {
 			return s.DeleteExpiredAsyncJobs(ctx)
+		})
+	})
+
+	// --- Phase: webhook deliveries ---
+
+	t.Run("WebhookDeliveries", func(t *testing.T) {
+		mkDelivery := func(id, webhookID, endpointID string, attemptNo int, outcome WebhookDeliveryOutcome, statusCode int, errMsg string, createdOffset time.Duration, expires *time.Time) *WebhookDelivery {
+			return &WebhookDelivery{
+				ID: id, WebhookID: webhookID, EndpointID: endpointID, AsyncJobID: "j1",
+				Event: tables.WebhookEventAsyncJobCompleted, AttemptNo: attemptNo,
+				Outcome: outcome, StatusCode: statusCode, Error: errMsg,
+				CreatedAt: base.Add(createdOffset), ExpiresAt: expires,
+			}
+		}
+		runOnAll(t, stores, func(ctx context.Context, s LogStore) error {
+			// wd1/wd2 are two attempts of the same delivery on one endpoint;
+			// wd3 belongs to another endpoint and expired ten minutes ago.
+			if err := s.CreateWebhookDelivery(ctx, mkDelivery("wd1", "wh1", "wh-ep-1", 1, WebhookDeliveryOutcomeRetryableFailure, 503, "upstream unavailable", -2*time.Minute, nil)); err != nil {
+				return err
+			}
+			if err := s.CreateWebhookDelivery(ctx, mkDelivery("wd2", "wh1", "wh-ep-1", 2, WebhookDeliveryOutcomeDelivered, 200, "", -time.Minute, nil)); err != nil {
+				return err
+			}
+			return s.CreateWebhookDelivery(ctx, mkDelivery("wd3", "wh2", "wh-ep-2", 1, WebhookDeliveryOutcomeExhausted, 500, "gave up", -time.Hour, timePtrP(base.Add(-10*time.Minute))))
+		})
+
+		assertParity(t, stores, 1e-6, func(ctx context.Context, s LogStore) (any, error) {
+			d, err := s.FindWebhookDeliveryByID(ctx, "wd1")
+			if err != nil {
+				return nil, err
+			}
+			return webhookDeliveryProjection(d), nil
+		})
+		for name, s := range stores {
+			_, err := s.FindWebhookDeliveryByID(ctx, "missing-delivery")
+			assert.ErrorIs(t, err, ErrNotFound, name)
+		}
+
+		// Endpoint-scoped history pages newest-first on every backend.
+		assertParity(t, stores, 1e-6, func(ctx context.Context, s LogStore) (any, error) {
+			res, err := s.SearchWebhookDeliveries(ctx, "wh-ep-1", PaginationOptions{Limit: 10})
+			if err != nil {
+				return nil, err
+			}
+			return webhookDeliverySearchProjection(res), nil
+		})
+		assertParity(t, stores, 1e-6, func(ctx context.Context, s LogStore) (any, error) {
+			res, err := s.SearchWebhookDeliveries(ctx, "wh-ep-1", PaginationOptions{Limit: 1, Offset: 1})
+			if err != nil {
+				return nil, err
+			}
+			return webhookDeliverySearchProjection(res), nil
+		})
+
+		// Expired cleanup removes wd3 with the same count everywhere.
+		assertParity(t, stores, 1e-6, func(ctx context.Context, s LogStore) (any, error) {
+			return s.DeleteExpiredWebhookDeliveries(ctx)
+		})
+		assertParity(t, stores, 1e-6, func(ctx context.Context, s LogStore) (any, error) {
+			res, err := s.SearchWebhookDeliveries(ctx, "wh-ep-2", PaginationOptions{Limit: 10})
+			if err != nil {
+				return nil, err
+			}
+			return webhookDeliverySearchProjection(res), nil
 		})
 	})
 

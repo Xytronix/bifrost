@@ -2,6 +2,7 @@
 package schemas
 
 import (
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ const (
 
 // AddSpan adds a span to the trace in a thread-safe manner
 func (t *Trace) AddSpan(span *Span) {
+	if t == nil || span == nil {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Spans = append(t.Spans, span)
@@ -44,9 +48,15 @@ func (t *Trace) AddSpan(span *Span) {
 
 // GetSpan retrieves a span by ID
 func (t *Trace) GetSpan(spanID string) *Span {
+	if t == nil || spanID == "" {
+		return nil
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, span := range t.Spans {
+		if span == nil {
+			continue
+		}
 		if span.SpanID == spanID {
 			return span
 		}
@@ -136,6 +146,60 @@ func (t *Trace) GetAttribute(key string) (any, bool) {
 	defer t.mu.Unlock()
 	value, ok := t.Attributes[key]
 	return value, ok
+}
+
+// SnapshotForExport returns a copy of the trace that is safe for concurrent
+// read-only use by observability exporters (Datadog, OTEL, ...) while the
+// original trace's spans may still be mutated.
+//
+// Trace- and span-level attribute maps are cloned under their respective locks,
+// so an exporter iterating the returned maps can never race a late writer — e.g.
+// streaming span finalization (completeDeferredSpan) or redaction replacement —
+// that legitimately holds the span lock. Without this, an exporter iterating the
+// live span.Attributes map (which cannot take the unexported span lock) triggers
+// a fatal "concurrent map iteration and map write" that recover() cannot catch.
+//
+// Span pointer identity is preserved *within* the returned trace: RootSpan and
+// the entries of Spans refer to the same copied *Span values, so pointer-equality
+// checks (e.g. span == finalAttempt) still work against the snapshot's own spans.
+// Attribute values are copied by reference and must be treated as read-only.
+func (t *Trace) SnapshotForExport() *Trace {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	clone := &Trace{
+		RequestID:      t.RequestID,
+		TraceID:        t.TraceID,
+		ParentID:       t.ParentID,
+		StartTime:      t.StartTime,
+		EndTime:        t.EndTime,
+		Attributes:     maps.Clone(t.Attributes),
+		RequestHeaders: maps.Clone(t.RequestHeaders),
+		PluginLogs:     append([]PluginLogEntry(nil), t.PluginLogs...),
+	}
+	spans := append([]*Span(nil), t.Spans...)
+	rootSpan := t.RootSpan
+	t.mu.Unlock()
+
+	spanCopies := make(map[*Span]*Span, len(spans))
+	clone.Spans = make([]*Span, 0, len(spans))
+	for _, span := range spans {
+		if span == nil {
+			continue
+		}
+		cp := span.snapshotForExport()
+		spanCopies[span] = cp
+		clone.Spans = append(clone.Spans, cp)
+	}
+	if rootSpan != nil {
+		if cp, ok := spanCopies[rootSpan]; ok {
+			clone.RootSpan = cp
+		} else {
+			clone.RootSpan = rootSpan.snapshotForExport()
+		}
+	}
+	return clone
 }
 
 // Reset clears the trace for reuse from pool
@@ -256,7 +320,7 @@ type Span struct {
 
 // SetAttribute sets an attribute on the span in a thread-safe manner
 func (s *Span) SetAttribute(key string, value any) {
-	if value == nil {
+	if s == nil || value == nil {
 		return
 	}
 	s.mu.Lock()
@@ -267,8 +331,44 @@ func (s *Span) SetAttribute(key string, value any) {
 	s.Attributes[key] = value
 }
 
+// snapshotForExport returns a copy of the span whose Attributes (and Events)
+// are cloned under the span lock, so observability exporters can read them
+// concurrently while a late writer (streaming finalization, redaction) may still
+// mutate the original span. See Trace.SnapshotForExport. The returned span has a
+// fresh zero-value mutex and its attribute values are copied by reference.
+func (s *Span) snapshotForExport() *Span {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := &Span{
+		SpanID:     s.SpanID,
+		ParentID:   s.ParentID,
+		TraceID:    s.TraceID,
+		Name:       s.Name,
+		Kind:       s.Kind,
+		StartTime:  s.StartTime,
+		EndTime:    s.EndTime,
+		Status:     s.Status,
+		StatusMsg:  s.StatusMsg,
+		Attributes: maps.Clone(s.Attributes),
+	}
+	if len(s.Events) > 0 {
+		cp.Events = make([]SpanEvent, len(s.Events))
+		for i := range s.Events {
+			cp.Events[i] = SpanEvent{
+				Name:       s.Events[i].Name,
+				Timestamp:  s.Events[i].Timestamp,
+				Attributes: maps.Clone(s.Events[i].Attributes),
+			}
+		}
+	}
+	return cp
+}
+
 // AddEvent adds an event to the span in a thread-safe manner
 func (s *Span) AddEvent(event SpanEvent) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Events = append(s.Events, event)
@@ -276,6 +376,9 @@ func (s *Span) AddEvent(event SpanEvent) {
 
 // End marks the span as complete with the given status
 func (s *Span) End(status SpanStatus, statusMsg string) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.EndTime = time.Now()
@@ -283,8 +386,12 @@ func (s *Span) End(status SpanStatus, statusMsg string) {
 	s.StatusMsg = statusMsg
 }
 
-// Reset clears the span for reuse from pool
+// Reset clears the span for reuse from pool. It holds s.mu — like every other
+// Span mutator — so a straggling writer (e.g. streaming finalization) that races
+// pool release can't trigger a fatal concurrent map access on s.Attributes.
 func (s *Span) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.SpanID = ""
 	s.ParentID = ""
 	s.TraceID = ""
@@ -450,6 +557,9 @@ const (
 	// unprefixed "error.type". Emitted in parallel from PopulateErrorAttributes.
 	AttrErrorType = "gen_ai.error.type"
 	AttrErrorCode = "gen_ai.error.code"
+	// AttrHTTPResponseStatusCode is the OTel semconv HTTP response status code (e.g. 400).
+	// Sourced from BifrostError.StatusCode; used as the status_code dimension on error metrics.
+	AttrHTTPResponseStatusCode = "http.response.status_code"
 
 	// Input/Output Attributes
 	AttrInputText      = "gen_ai.input.text"
@@ -578,6 +688,15 @@ const (
 	AttrToolCallResult    = "gen_ai.tool.call.result"
 	AttrToolType          = "gen_ai.tool.type"
 
+	// OTel MCP semconv attributes on mcp.client spans, read by the duration metric.
+	AttrMCPMethodName    = "mcp.method.name"   // e.g. tools/call, tools/list, ping
+	AttrNetworkTransport = "network.transport" // pipe (stdio) | tcp (http/sse)
+
+	// Tool-execution latency (ms) — the raw CallTool round-trip — so the duration metric
+	// measures it, not span wall-time (which covers the PostHooks). Bifrost-namespaced; not
+	// OTel MCP semconv.
+	AttrBifrostMCPToolDurationMs = "bifrost.mcp.tool.duration_ms"
+
 	// =====================================================================
 	// Bifrost-namespaced attributes (bifrost.*)
 	//
@@ -611,8 +730,11 @@ const (
 	AttrBifrostBusinessUnitNames   = "bifrost.business_unit.names"
 	AttrBifrostUserID              = "bifrost.user.id"
 	AttrBifrostUserName            = "bifrost.user.name"
+	AttrBifrostUserEmail           = "bifrost.user.email"
 	AttrBifrostRetries             = "bifrost.retries"
 	AttrBifrostFallbackIndex       = "bifrost.fallback_index"
+	AttrBifrostAlias               = "bifrost.alias"                // original requested model when it differs from the resolved model
+	AttrBifrostRoutingEngineUsed   = "bifrost.routing_engine_used"  // comma-joined routing engines that handled the request
 	AttrBifrostStopSequencesJoined = "bifrost.request.stop_sequences"
 
 	// OTel general semconv (no gen_ai prefix). Emitted alongside the legacy
