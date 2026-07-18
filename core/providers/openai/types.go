@@ -77,7 +77,7 @@ func (r *OpenAIEmbeddingRequest) SetExtraParams(params map[string]interface{}) {
 type OpenAIRerankRequest struct {
 	Model           string                   `json:"model"`
 	Query           string                   `json:"query"`
-	Documents       []schemas.RerankDocument `json:"documents"`
+	Documents       []string                 `json:"documents"` // Voyage/Cohere-v2/most /v1/rerank APIs require a plain string array
 	TopN            *int                     `json:"top_n,omitempty"`
 	MaxTokensPerDoc *int                     `json:"max_tokens_per_doc,omitempty"`
 	Priority        *int                     `json:"priority,omitempty"`

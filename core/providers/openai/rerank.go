@@ -17,7 +17,7 @@ func ToOpenAIRerankRequest(request *schemas.BifrostRerankRequest) *OpenAIRerankR
 	converted := &OpenAIRerankRequest{
 		Model:     request.Model,
 		Query:     request.Query,
-		Documents: request.Documents,
+		Documents: rerankDocumentsToStrings(request.Documents),
 	}
 	if request.Params != nil {
 		converted.TopN = request.Params.TopN
@@ -26,6 +26,36 @@ func ToOpenAIRerankRequest(request *schemas.BifrostRerankRequest) *OpenAIRerankR
 		converted.ExtraParams = request.Params.ExtraParams
 	}
 	return converted
+}
+
+// rerankDocumentsToStrings converts structured rerank documents into the plain
+// string array that Voyage, Cohere v2, and most OpenAI-compatible /v1/rerank
+// APIs expect. Text-only documents map to their text; documents carrying id or
+// meta are JSON-encoded so that information is preserved on the wire.
+func rerankDocumentsToStrings(documents []schemas.RerankDocument) []string {
+	if documents == nil {
+		return nil
+	}
+	out := make([]string, len(documents))
+	for i, doc := range documents {
+		if doc.ID == nil && len(doc.Meta) == 0 {
+			out[i] = doc.Text
+			continue
+		}
+		payload := map[string]interface{}{"text": doc.Text}
+		if doc.ID != nil {
+			payload["id"] = *doc.ID
+		}
+		if len(doc.Meta) > 0 {
+			payload["metadata"] = doc.Meta
+		}
+		if encoded, err := json.Marshal(payload); err == nil {
+			out[i] = string(encoded)
+		} else {
+			out[i] = doc.Text
+		}
+	}
+	return out
 }
 
 // ToBifrostRerankResponse converts an OpenAI-compatible rerank response to Bifrost format

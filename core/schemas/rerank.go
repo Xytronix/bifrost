@@ -1,10 +1,38 @@
 package schemas
 
+import (
+	"bytes"
+	"encoding/json"
+)
+
 // RerankDocument represents a document to be reranked.
 type RerankDocument struct {
 	Text string                 `json:"text"`
 	ID   *string                `json:"id,omitempty"`
 	Meta map[string]interface{} `json:"meta,omitempty"`
+}
+
+// UnmarshalJSON accepts a rerank document as either a bare JSON string (the
+// format Cohere v2, Voyage, and most /v1/rerank APIs use) or a structured
+// object with text/id/meta fields. This lets clients send `documents` as a
+// plain string array without a 400 "Invalid request payload".
+func (d *RerankDocument) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		*d = RerankDocument{Text: s}
+		return nil
+	}
+	type rerankDocumentAlias RerankDocument
+	var alias rerankDocumentAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*d = RerankDocument(alias)
+	return nil
 }
 
 // RerankParameters contains optional parameters for a rerank request.
