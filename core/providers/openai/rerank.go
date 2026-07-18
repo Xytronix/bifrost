@@ -67,7 +67,12 @@ func (response *OpenAIRerankResponse) ToBifrostRerankResponse(documents []schema
 	bifrostResponse := &schemas.BifrostRerankResponse{
 		ID: response.ID,
 	}
-	for _, result := range response.Results {
+	results := response.Results
+	if len(results) == 0 {
+		// Voyage (and some other rerank APIs) return ranked results under "data".
+		results = response.Data
+	}
+	for _, result := range results {
 		rerankResult := schemas.RerankResult{
 			Index:          result.Index,
 			RelevanceScore: result.RelevanceScore,

@@ -41,3 +41,21 @@ func TestToOpenAIRerankRequestEncodesDocumentMetadata(t *testing.T) {
 		t.Fatalf("expected id/text preserved in encoded document, got %q", req.Documents[0])
 	}
 }
+
+// Voyage returns ranked results under `data` rather than `results`; the parser
+// must fall back to it. Regression for null results on Voyage rerank.
+func TestOpenAIRerankResponseAcceptsDataArray(t *testing.T) {
+	resp := &OpenAIRerankResponse{
+		Data: []OpenAIRerankResponseResult{
+			{Index: 1, RelevanceScore: 0.9},
+			{Index: 0, RelevanceScore: 0.5},
+		},
+	}
+	b := resp.ToBifrostRerankResponse(nil, false)
+	if len(b.Results) != 2 {
+		t.Fatalf("expected 2 results from data[], got %#v", b.Results)
+	}
+	if b.Results[0].Index != 1 || b.Results[0].RelevanceScore != 0.9 {
+		t.Fatalf("expected top result index=1 score=0.9, got %#v", b.Results[0])
+	}
+}

@@ -92,6 +92,7 @@ func (r *OpenAIRerankRequest) GetExtraParams() map[string]interface{} {
 type OpenAIRerankResponse struct {
 	ID      string                       `json:"id"`
 	Results []OpenAIRerankResponseResult `json:"results"`
+	Data    []OpenAIRerankResponseResult `json:"data,omitempty"` // Voyage rerank returns ranked results under "data"
 	Meta    *OpenAIRerankMeta            `json:"meta,omitempty"`
 	Usage   *schemas.BifrostLLMUsage     `json:"usage,omitempty"`
 }
