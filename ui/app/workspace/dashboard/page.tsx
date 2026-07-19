@@ -199,6 +199,7 @@ export default function DashboardPage() {
 	const buRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
 	const userRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
 	const virtualKeyRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
+	const appRankingsRef = useRef<DimensionRankingsTabViewHandle>(null);
 
 	const allRefs = [
 		overviewRef,
@@ -210,6 +211,7 @@ export default function DashboardPage() {
 		buRankingsRef,
 		userRankingsRef,
 		virtualKeyRankingsRef,
+		appRankingsRef,
 	];
 
 	const getDashboardData = useCallback((): DashboardData => {
@@ -232,6 +234,7 @@ export default function DashboardPage() {
 			buRankingsData: null,
 			userRankingsData: null,
 			virtualKeyRankingsData: null,
+			appRankingsData: null,
 			mcpHistogramData: null,
 			mcpCostData: null,
 			mcpTopToolsData: null,
@@ -401,6 +404,7 @@ export default function DashboardPage() {
 			"dashboard-section-bu-rankings",
 			"dashboard-section-user-rankings",
 			"dashboard-section-virtual-key-rankings",
+			"dashboard-section-app-rankings",
 		];
 		return ids.map((id) => document.getElementById(id)).filter(Boolean) as HTMLElement[];
 	}, [handlePreloadData]);
@@ -521,10 +525,12 @@ export default function DashboardPage() {
 								</TabsTrigger>
 								<TabsTrigger className="shrink-0" value="bu-rankings" data-testid="dashboard-tab-bu-rankings">
 									BU Rankings
-								</TabsTrigger>
+                </TabsTrigger>
+                <TabsTrigger value="app-rankings" data-testid="dashboard-tab-app-rankings">
+								App Rankings
+							</TabsTrigger>
 							</TabsList>
 						</div>
-
 						{/* Overview Tab */}
 						<TabsContent value="overview" {...(pdfMode && { forceMount: true })}>
 							<div id="dashboard-section-overview">
@@ -684,6 +690,20 @@ export default function DashboardPage() {
 									dimensionLabel="Virtual Key"
 									testIdPrefix="dashboard-virtual-key-rankings"
 									dataKey="virtualKeyRankingsData"
+								/>
+							</div>
+						</TabsContent>
+						{/* App Rankings Tab */}
+						<TabsContent value="app-rankings" {...(pdfMode && { forceMount: true })}>
+							<div id="dashboard-section-app-rankings">
+								<DimensionRankingsTabView
+									ref={appRankingsRef}
+									filters={filters}
+									active={activeTab === "app-rankings" || pdfMode}
+									dimension="app"
+									dimensionLabel="App"
+									testIdPrefix="dashboard-app-rankings"
+									dataKey="appRankingsData"
 								/>
 							</div>
 						</TabsContent>

@@ -1,4 +1,3 @@
-- feat: migrate cost recalculation to durable background sidekiq job with resume and dedup
-- feat: redact trace content before connector export
-- fix: match model filter on canonical_model_name and restore routing info for cost recalculation
-- chore: upgraded core to v1.7.1 and framework to v1.5.1
+- feat: added user-agent tracking to LLM and MCP logs
+- fix: added missing direct `github.com/google/uuid` dependency
+- chore: upgraded core to v1.7.2 and framework to v1.5.2
