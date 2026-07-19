@@ -309,3 +309,42 @@ func TestEntryUnmarshalJSON_DerivesInputModalitiesFromVision(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractSupportedParams_ReasoningEffortTiers(t *testing.T) {
+	got := extractSupportedParams(&modelParametersParseResult{
+		SupportsReasoning:              capabilityBoolPtr(true),
+		SupportsMinimalReasoningEffort: capabilityBoolPtr(true),
+		SupportsXhighReasoningEffort:   capabilityBoolPtr(true),
+		SupportsAdaptiveThinking:       capabilityBoolPtr(true),
+		SupportsMaxReasoningEffort:     capabilityBoolPtr(false),
+	})
+	for _, want := range []string{"reasoning", "reasoning_effort:minimal", "reasoning_effort:xhigh", "adaptive_thinking"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("expected supported params to include %q, got %v", want, got)
+		}
+	}
+	if slices.Contains(got, "reasoning_effort:max") {
+		t.Errorf("expected reasoning_effort:max to be omitted when unset, got %v", got)
+	}
+}
+
+func TestEntryUnmarshalJSON_DerivesOutputAndRichInputModalities(t *testing.T) {
+	var e Entry
+	raw := `{"provider":"openai","mode":"chat","supports_vision":true,"supports_audio_input":true,"supports_pdf_input":true,"supported_output_modalities":["text","image"]}`
+	if err := json.Unmarshal([]byte(raw), &e); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if e.Architecture == nil {
+		t.Fatal("expected architecture to be populated")
+	}
+	for _, want := range []string{"text", "image", "audio", "file"} {
+		if !slices.Contains(e.Architecture.InputModalities, want) {
+			t.Errorf("expected input modality %q, got %v", want, e.Architecture.InputModalities)
+		}
+	}
+	for _, want := range []string{"text", "image"} {
+		if !slices.Contains(e.Architecture.OutputModalities, want) {
+			t.Errorf("expected output modality %q, got %v", want, e.Architecture.OutputModalities)
+		}
+	}
+}

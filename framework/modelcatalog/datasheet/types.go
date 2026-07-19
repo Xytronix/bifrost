@@ -68,9 +68,13 @@ func (p *Entry) UnmarshalJSON(data []byte) error {
 			Medium *float64 `json:"search_context_size_medium"`
 			High   *float64 `json:"search_context_size_high"`
 		} `json:"search_context_cost_per_query,omitempty"`
-		SupportsVision           *bool    `json:"supports_vision,omitempty"`
-		SupportedModalities      []string `json:"supported_modalities,omitempty"`
-		SupportedInputModalities []string `json:"supported_input_modalities,omitempty"`
+		SupportsVision            *bool    `json:"supports_vision,omitempty"`
+		SupportedModalities       []string `json:"supported_modalities,omitempty"`
+		SupportedInputModalities  []string `json:"supported_input_modalities,omitempty"`
+		SupportsAudioInput        *bool    `json:"supports_audio_input,omitempty"`
+		SupportsVideoInput        *bool    `json:"supports_video_input,omitempty"`
+		SupportsPdfInput          *bool    `json:"supports_pdf_input,omitempty"`
+		SupportedOutputModalities []string `json:"supported_output_modalities,omitempty"`
 	}
 	if err := sonic.Unmarshal(data, &raw); err != nil {
 		return err
@@ -92,37 +96,73 @@ func (p *Entry) UnmarshalJSON(data []byte) error {
 		}
 	}
 
-	// The datasheet reports vision via supports_vision / supported_modalities
-	// (LiteLLM shape) rather than an architecture block, so derive input
-	// modalities here. Only a positive image capability is emitted; text-only
-	// rows stay unset so downstream consumers keep their own defaults.
-	if p.Architecture == nil || len(p.Architecture.InputModalities) == 0 {
-		if datasheetSupportsImageInput(raw.SupportsVision, raw.SupportedInputModalities, raw.SupportedModalities) {
-			if p.Architecture == nil {
-				p.Architecture = &schemas.Architecture{}
-			}
-			p.Architecture.InputModalities = []string{"text", "image"}
+	// The datasheet reports modalities via supports_* flags / supported_modalities
+	// (LiteLLM shape) rather than an architecture block, so derive them here.
+	// Input modalities are emitted only when a non-text modality is present, so
+	// text-only rows stay unset and downstream consumers keep their own defaults.
+	if inputMods := datasheetInputModalities(raw.SupportsVision, raw.SupportsAudioInput, raw.SupportsVideoInput, raw.SupportsPdfInput, raw.SupportedInputModalities, raw.SupportedModalities); len(inputMods) > 0 {
+		if p.Architecture == nil {
+			p.Architecture = &schemas.Architecture{}
+		}
+		if len(p.Architecture.InputModalities) == 0 {
+			p.Architecture.InputModalities = inputMods
+		}
+	}
+	if outputMods := normalizeModalities(raw.SupportedOutputModalities); len(outputMods) > 0 {
+		if p.Architecture == nil {
+			p.Architecture = &schemas.Architecture{}
+		}
+		if len(p.Architecture.OutputModalities) == 0 {
+			p.Architecture.OutputModalities = outputMods
 		}
 	}
 	return nil
 }
 
-// datasheetSupportsImageInput reports whether a datasheet row advertises image
-// input, via the LiteLLM supports_vision flag or any supported-modality list
-// containing "image". Used to derive Architecture.InputModalities for the
-// list-models enrichment path since the datasheet ships no architecture block.
-func datasheetSupportsImageInput(supportsVision *bool, modalityLists ...[]string) bool {
-	if supportsVision != nil && *supportsVision {
-		return true
-	}
-	for _, list := range modalityLists {
-		for _, m := range list {
-			if strings.EqualFold(strings.TrimSpace(m), "image") {
-				return true
-			}
+// normalizeModalities lowercases, trims, and de-dups a datasheet modality list.
+func normalizeModalities(list []string) []string {
+	var out []string
+	for _, m := range list {
+		v := strings.ToLower(strings.TrimSpace(m))
+		if v != "" && !slices.Contains(out, v) {
+			out = append(out, v)
 		}
 	}
-	return false
+	return out
+}
+
+// datasheetInputModalities derives the input modality list a model accepts from
+// the datasheet's explicit modality lists or its supports_* capability flags.
+// Returns nil for text-only models so downstream consumers keep their defaults.
+func datasheetInputModalities(supportsVision, supportsAudio, supportsVideo, supportsPdf *bool, explicit ...[]string) []string {
+	isSet := func(b *bool) bool { return b != nil && *b }
+	for _, list := range explicit {
+		mods := normalizeModalities(list)
+		if len(mods) == 0 || (len(mods) == 1 && mods[0] == "text") {
+			continue
+		}
+		if !slices.Contains(mods, "text") {
+			mods = append([]string{"text"}, mods...)
+		}
+		return mods
+	}
+	mods := []string{"text"}
+	if isSet(supportsVision) {
+		mods = append(mods, "image")
+	}
+	if isSet(supportsAudio) {
+		mods = append(mods, "audio")
+	}
+	if isSet(supportsVideo) {
+		mods = append(mods, "video")
+	}
+	if isSet(supportsPdf) {
+		mods = append(mods, "file")
+	}
+	if len(mods) == 1 {
+		return nil
+	}
+	return mods
 }
 
 // Options holds every individual cost field. Embedded into Entry and reused
@@ -362,6 +402,12 @@ type modelParametersParseResult struct {
 	SupportsPromptCaching           *bool `json:"supports_prompt_caching,omitempty"`
 	SupportsWebSearch               *bool `json:"supports_web_search,omitempty"`
 	VertexMultiRegionOnly           *bool `json:"vertex_multi_region_only,omitempty"`
+	SupportsMinimalReasoningEffort  *bool `json:"supports_minimal_reasoning_effort,omitempty"`
+	SupportsLowReasoningEffort      *bool `json:"supports_low_reasoning_effort,omitempty"`
+	SupportsMaxReasoningEffort      *bool `json:"supports_max_reasoning_effort,omitempty"`
+	SupportsXhighReasoningEffort    *bool `json:"supports_xhigh_reasoning_effort,omitempty"`
+	SupportsNoneReasoningEffort     *bool `json:"supports_none_reasoning_effort,omitempty"`
+	SupportsAdaptiveThinking        *bool `json:"supports_adaptive_thinking,omitempty"`
 }
 
 // --- private helpers (shared across pricing/*.go files) ---
@@ -542,6 +588,23 @@ func extractSupportedParams(parsed *modelParametersParseResult) []string {
 	}
 	if parsed.SupportsReasoning != nil && *parsed.SupportsReasoning {
 		addParam("reasoning")
+	}
+	for _, e := range []struct {
+		flag  *bool
+		token string
+	}{
+		{parsed.SupportsMinimalReasoningEffort, "reasoning_effort:minimal"},
+		{parsed.SupportsLowReasoningEffort, "reasoning_effort:low"},
+		{parsed.SupportsMaxReasoningEffort, "reasoning_effort:max"},
+		{parsed.SupportsXhighReasoningEffort, "reasoning_effort:xhigh"},
+		{parsed.SupportsNoneReasoningEffort, "reasoning_effort:none"},
+	} {
+		if e.flag != nil && *e.flag {
+			addParam(e.token)
+		}
+	}
+	if parsed.SupportsAdaptiveThinking != nil && *parsed.SupportsAdaptiveThinking {
+		addParam("adaptive_thinking")
 	}
 	if parsed.SupportsReasoningWithToolCalls == nil || *parsed.SupportsReasoningWithToolCalls {
 		addParam("reasoning_with_tool_calls")

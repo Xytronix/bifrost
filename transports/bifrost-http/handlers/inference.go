@@ -967,6 +967,15 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 				}
 			}
 		}
+		if len(modelEntry.SupportedParameters) == 0 {
+			if params := supportedParamsForModel(catalog, modelName); len(params) > 0 {
+				modelEntry.SupportedParameters = params
+			} else if modelEntry.Alias != nil {
+				if params := supportedParamsForModel(catalog, *modelEntry.Alias); len(params) > 0 {
+					modelEntry.SupportedParameters = params
+				}
+			}
+		}
 		resp.Data[i] = modelEntry
 	}
 }
@@ -1028,6 +1037,32 @@ func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *m
 		seen[base] = true
 		if e := idx[base]; e != nil {
 			return e
+		}
+	}
+	return nil
+}
+
+// supportedParamsForModel resolves a model's OpenAI-compatible supported
+// parameters (tools, reasoning, response_format, reasoning_effort:* tiers, …)
+// from the model-parameters datasheet, trying the same progressively
+// less-specific forms as fallbackEntryForModel so aggregator/effort aliases
+// resolve to the base entry. Dynamic — no per-model overrides.
+func supportedParamsForModel(catalog *modelcatalog.ModelCatalog, model string) []string {
+	seen := map[string]bool{}
+	for _, cand := range []string{
+		model,
+		stripTrailingModelMarkers(model),
+		lastPathSegment(model),
+		stripTrailingModelMarkers(lastPathSegment(model)),
+	} {
+		for _, name := range []string{cand, catalog.BaseModelName(cand)} {
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			if params := catalog.GetSupportedParameters(name); len(params) > 0 {
+				return params
+			}
 		}
 	}
 	return nil
