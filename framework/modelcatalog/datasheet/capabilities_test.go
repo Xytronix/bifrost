@@ -1,6 +1,7 @@
 package datasheet
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 
@@ -280,5 +281,31 @@ func TestExtractSupportedParams_WebSearchAbsent(t *testing.T) {
 		if slices.Contains(got, unexpected) {
 			t.Errorf("expected supported params to omit %q, got %v", unexpected, got)
 		}
+	}
+}
+
+func TestEntryUnmarshalJSON_DerivesInputModalitiesFromVision(t *testing.T) {
+	cases := []struct {
+		name    string
+		json    string
+		wantImg bool
+	}{
+		{"supports_vision", `{"provider":"openai","mode":"chat","supports_vision":true}`, true},
+		{"supported_input_modalities", `{"provider":"x","mode":"chat","supported_input_modalities":["text","image"]}`, true},
+		{"supported_modalities", `{"provider":"x","mode":"chat","supported_modalities":["text","image"]}`, true},
+		{"text_only", `{"provider":"openai","mode":"chat","supports_vision":false}`, false},
+		{"no_signal", `{"provider":"openai","mode":"chat"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var e Entry
+			if err := json.Unmarshal([]byte(tc.json), &e); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			gotImg := e.Architecture != nil && slices.Contains(e.Architecture.InputModalities, "image")
+			if gotImg != tc.wantImg {
+				t.Fatalf("image modality = %v, want %v (architecture=%#v)", gotImg, tc.wantImg, e.Architecture)
+			}
+		})
 	}
 }

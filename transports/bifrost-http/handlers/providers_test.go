@@ -691,6 +691,54 @@ func TestEnrichListModelsResponse_StripsInnerOrgPrefixForFallbackPricing(t *test
 	}
 }
 
+func TestEnrichListModelsResponse_DerivesVisionInputModalities(t *testing.T) {
+	// The datasheet advertises vision via supports_vision (no architecture
+	// block). Enrichment must surface it as architecture.input_modalities so
+	// downstream consumers (omp /switch) can flag image capability — for both a
+	// native provider match and a custom/aggregator base-name fallback, while
+	// text-only rows stay unset.
+	schemas.RegisterKnownProvider("Custom Router")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("Custom Router") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"gpt-4o": {"provider":"openai","mode":"chat","base_model":"gpt-4o","max_input_tokens":128000,"input_cost_per_token":0.0000025,"supports_vision":true},
+		"text-only-model": {"provider":"openai","mode":"chat","base_model":"text-only-model","max_input_tokens":32000,"input_cost_per_token":0.000001}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "openai/gpt-4o"},
+		{ID: "Custom Router/gpt-4o"},
+		{ID: "openai/text-only-model"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+	hasImage := func(m schemas.Model) bool {
+		if m.Architecture == nil {
+			return false
+		}
+		for _, mod := range m.Architecture.InputModalities {
+			if mod == "image" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasImage(byID["openai/gpt-4o"]) {
+		t.Fatalf("native vision model should expose image input modality, got %#v", byID["openai/gpt-4o"].Architecture)
+	}
+	if !hasImage(byID["Custom Router/gpt-4o"]) {
+		t.Fatalf("custom vision model should borrow image input modality via base-name fallback, got %#v", byID["Custom Router/gpt-4o"].Architecture)
+	}
+	if hasImage(byID["openai/text-only-model"]) {
+		t.Fatalf("text-only model must not advertise image input, got %#v", byID["openai/text-only-model"].Architecture)
+	}
+}
+
 func TestListModels_UnfilteredIgnoresKeys(t *testing.T) {
 	SetLogger(&mockLogger{})
 

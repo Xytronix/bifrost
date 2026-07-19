@@ -68,6 +68,9 @@ func (p *Entry) UnmarshalJSON(data []byte) error {
 			Medium *float64 `json:"search_context_size_medium"`
 			High   *float64 `json:"search_context_size_high"`
 		} `json:"search_context_cost_per_query,omitempty"`
+		SupportsVision           *bool    `json:"supports_vision,omitempty"`
+		SupportedModalities      []string `json:"supported_modalities,omitempty"`
+		SupportedInputModalities []string `json:"supported_input_modalities,omitempty"`
 	}
 	if err := sonic.Unmarshal(data, &raw); err != nil {
 		return err
@@ -88,7 +91,38 @@ func (p *Entry) UnmarshalJSON(data []byte) error {
 			p.SearchContextCostPerQuery = q.High
 		}
 	}
+
+	// The datasheet reports vision via supports_vision / supported_modalities
+	// (LiteLLM shape) rather than an architecture block, so derive input
+	// modalities here. Only a positive image capability is emitted; text-only
+	// rows stay unset so downstream consumers keep their own defaults.
+	if p.Architecture == nil || len(p.Architecture.InputModalities) == 0 {
+		if datasheetSupportsImageInput(raw.SupportsVision, raw.SupportedInputModalities, raw.SupportedModalities) {
+			if p.Architecture == nil {
+				p.Architecture = &schemas.Architecture{}
+			}
+			p.Architecture.InputModalities = []string{"text", "image"}
+		}
+	}
 	return nil
+}
+
+// datasheetSupportsImageInput reports whether a datasheet row advertises image
+// input, via the LiteLLM supports_vision flag or any supported-modality list
+// containing "image". Used to derive Architecture.InputModalities for the
+// list-models enrichment path since the datasheet ships no architecture block.
+func datasheetSupportsImageInput(supportsVision *bool, modalityLists ...[]string) bool {
+	if supportsVision != nil && *supportsVision {
+		return true
+	}
+	for _, list := range modalityLists {
+		for _, m := range list {
+			if strings.EqualFold(strings.TrimSpace(m), "image") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Options holds every individual cost field. Embedded into Entry and reused

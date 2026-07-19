@@ -937,7 +937,7 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 		// sharing the same base model name. Custom routes usually resell the
 		// canonical model at ~canonical rates, so the pricing is a best-effort
 		// estimate consumers (omp, agentsview) can surface instead of $0.
-		if modelEntry.ContextLength == nil {
+		if modelEntry.ContextLength == nil || modelEntry.Architecture == nil {
 			if anyProviderIdx == nil {
 				anyProviderIdx = catalog.CapabilityEntriesByBaseName()
 			}
@@ -946,10 +946,12 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 				fallback = fallbackEntryForModel(anyProviderIdx, catalog, *modelEntry.Alias)
 			}
 			if fallback != nil {
-				if fallback.ContextLength != nil {
-					modelEntry.ContextLength = fallback.ContextLength
-				} else if fallback.MaxInputTokens != nil {
-					modelEntry.ContextLength = fallback.MaxInputTokens
+				if modelEntry.ContextLength == nil {
+					if fallback.ContextLength != nil {
+						modelEntry.ContextLength = fallback.ContextLength
+					} else if fallback.MaxInputTokens != nil {
+						modelEntry.ContextLength = fallback.MaxInputTokens
+					}
 				}
 				if fallback.MaxInputTokens != nil && modelEntry.MaxInputTokens == nil {
 					modelEntry.MaxInputTokens = fallback.MaxInputTokens
