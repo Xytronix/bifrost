@@ -586,10 +586,13 @@ func extractSupportedParams(parsed *modelParametersParseResult) []string {
 	if parsed.SupportsToolChoice != nil && *parsed.SupportsToolChoice {
 		addParam("tool_choice")
 	}
-	if parsed.SupportsReasoning != nil && *parsed.SupportsReasoning {
-		addParam("reasoning")
-	}
-	for _, e := range []struct {
+	// The datasheet names only the tiers BEYOND the standard low/medium/high
+	// reasoning-effort scale, so `supports_xhigh + supports_max` means
+	// "low..high plus xhigh and max", not "xhigh and max only". Emitting just
+	// the extras made consumers read the ladder as two tiers wide and clamp
+	// their effort selector to it, so the base scale is emitted for every
+	// reasoning-capable model and the flags widen it.
+	extraEffortTiers := []struct {
 		flag  *bool
 		token string
 	}{
@@ -598,7 +601,21 @@ func extractSupportedParams(parsed *modelParametersParseResult) []string {
 		{parsed.SupportsMaxReasoningEffort, "reasoning_effort:max"},
 		{parsed.SupportsXhighReasoningEffort, "reasoning_effort:xhigh"},
 		{parsed.SupportsNoneReasoningEffort, "reasoning_effort:none"},
-	} {
+	}
+	reasons := parsed.SupportsReasoning != nil && *parsed.SupportsReasoning
+	for _, e := range extraEffortTiers {
+		if e.flag != nil && *e.flag {
+			reasons = true
+			break
+		}
+	}
+	if reasons {
+		addParam("reasoning")
+		addParam("reasoning_effort:low")
+		addParam("reasoning_effort:medium")
+		addParam("reasoning_effort:high")
+	}
+	for _, e := range extraEffortTiers {
 		if e.flag != nil && *e.flag {
 			addParam(e.token)
 		}

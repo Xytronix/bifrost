@@ -318,13 +318,51 @@ func TestExtractSupportedParams_ReasoningEffortTiers(t *testing.T) {
 		SupportsAdaptiveThinking:       capabilityBoolPtr(true),
 		SupportsMaxReasoningEffort:     capabilityBoolPtr(false),
 	})
-	for _, want := range []string{"reasoning", "reasoning_effort:minimal", "reasoning_effort:xhigh", "adaptive_thinking"} {
+	for _, want := range []string{
+		"reasoning",
+		"reasoning_effort:minimal",
+		"reasoning_effort:low",
+		"reasoning_effort:medium",
+		"reasoning_effort:high",
+		"reasoning_effort:xhigh",
+		"adaptive_thinking",
+	} {
 		if !slices.Contains(got, want) {
 			t.Errorf("expected supported params to include %q, got %v", want, got)
 		}
 	}
 	if slices.Contains(got, "reasoning_effort:max") {
 		t.Errorf("expected reasoning_effort:max to be omitted when unset, got %v", got)
+	}
+}
+
+// A model that only declares supports_reasoning still accepts the standard
+// low/medium/high effort scale — consumers must not be left guessing.
+func TestExtractSupportedParams_BaseEffortScaleForPlainReasoningModel(t *testing.T) {
+	got := extractSupportedParams(&modelParametersParseResult{
+		SupportsReasoning: capabilityBoolPtr(true),
+	})
+	for _, want := range []string{"reasoning_effort:low", "reasoning_effort:medium", "reasoning_effort:high"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("expected supported params to include %q, got %v", want, got)
+		}
+	}
+	for _, unwanted := range []string{"reasoning_effort:minimal", "reasoning_effort:xhigh", "reasoning_effort:max"} {
+		if slices.Contains(got, unwanted) {
+			t.Errorf("expected %q to be omitted when unset, got %v", unwanted, got)
+		}
+	}
+}
+
+// No reasoning support at all ⇒ no effort ladder.
+func TestExtractSupportedParams_NoEffortScaleForNonReasoningModel(t *testing.T) {
+	got := extractSupportedParams(&modelParametersParseResult{
+		SupportsFunctionCalling: capabilityBoolPtr(true),
+	})
+	for _, unwanted := range []string{"reasoning", "reasoning_effort:low", "reasoning_effort:high"} {
+		if slices.Contains(got, unwanted) {
+			t.Errorf("expected %q to be omitted for a non-reasoning model, got %v", unwanted, got)
+		}
 	}
 }
 
