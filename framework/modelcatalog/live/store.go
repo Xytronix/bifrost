@@ -75,6 +75,26 @@ func (s *Store) InvalidateProvider(provider schemas.ModelProvider) {
 	s.mu.Unlock()
 }
 
+// RetainKeys drops every entry for provider whose KeyID is not in keep.
+// Used by ReloadProvider so a re-discovery does not wipe the last-good
+// catalog for keys that are still configured and enabled — only entries for
+// removed or disabled keys are pruned before the refetch.
+func (s *Store) RetainKeys(provider schemas.ModelProvider, keep map[string]struct{}) {
+	if keep == nil {
+		keep = map[string]struct{}{}
+	}
+	s.mu.Lock()
+	for k := range s.entries {
+		if k.Provider != provider {
+			continue
+		}
+		if _, ok := keep[k.KeyID]; !ok {
+			delete(s.entries, k)
+		}
+	}
+	s.mu.Unlock()
+}
+
 // ModelsForProvider returns the union of filtered entries for the provider,
 // sorted. Filtered entries are pre-gated so this is the effective allowed set
 // across the provider's keys.

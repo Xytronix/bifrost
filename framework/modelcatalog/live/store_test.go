@@ -88,6 +88,35 @@ func TestInvalidateProviderDropsEverything(t *testing.T) {
 	}
 }
 
+func TestRetainKeysKeepsConfiguredKeys(t *testing.T) {
+	s := New(nil)
+	upsertFiltered(s, openai, "k1", []string{"gpt-4o"})
+	upsertUnfiltered(s, openai, "k1", []string{"gpt-4o", "extra"})
+	upsertFiltered(s, openai, "k2", []string{"o1"})
+	upsertFiltered(s, anthropic, "k3", []string{"claude-3-5-sonnet"})
+
+	s.RetainKeys(openai, map[string]struct{}{"k1": {}})
+
+	if got := s.ModelsForProvider(openai); !slices.Equal(got, []string{"gpt-4o"}) {
+		t.Errorf("openai after RetainKeys = %v, want [gpt-4o]", got)
+	}
+	if got := s.UnfilteredModelsForProvider(openai); !slices.Equal(got, []string{"extra", "gpt-4o"}) {
+		t.Errorf("openai unfiltered after RetainKeys = %v, want [extra gpt-4o]", got)
+	}
+	if got := s.ModelsForProvider(anthropic); !slices.Equal(got, []string{"claude-3-5-sonnet"}) {
+		t.Errorf("anthropic untouched = %v, want [claude-3-5-sonnet]", got)
+	}
+}
+
+func TestRetainKeysEmptyKeepDropsProvider(t *testing.T) {
+	s := New(nil)
+	upsertFiltered(s, openai, "k1", []string{"gpt-4o"})
+	s.RetainKeys(openai, nil)
+	if got := s.ModelsForProvider(openai); len(got) != 0 {
+		t.Errorf("openai after empty RetainKeys = %v, want empty", got)
+	}
+}
+
 func TestKeylessProviderUsesEmptyKeyID(t *testing.T) {
 	s := New(nil)
 	upsertFiltered(s, schemas.Vertex, "", []string{"gemini-2.0-flash"})

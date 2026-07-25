@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
+	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 )
@@ -239,6 +242,78 @@ func TestOnKeyUpdated_DisabledKeySkipsFetchButInvalidatesCache(t *testing.T) {
 
 	if models := server.Config.ModelCatalog.GetModelsForProvider("custom-provider"); len(models) != 0 {
 		t.Fatalf("expected InvalidateLive to drop the disabled key's cached models, got %v", models)
+	}
+}
+
+// reloadProviderConfigStore is a minimal ConfigStore stub for ReloadProvider
+// unit tests. Only GetProvider is exercised; the live-catalog path reads keys
+// from the in-memory Config.Providers map.
+type reloadProviderConfigStore struct {
+	configstore.ConfigStore
+	provider *tables.TableProvider
+	err      error
+}
+
+func (s *reloadProviderConfigStore) GetProvider(_ context.Context, _ schemas.ModelProvider) (*tables.TableProvider, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.provider, nil
+}
+
+// TestReloadProvider_RetainLiveKeysKeepsLastGood pins the keep-set prune that
+// ReloadProvider applies before refetching: entries for still-enabled keys
+// survive so a failed list-models does not blank the catalog, while entries
+// for removed/disabled keys are dropped so routing never serves them.
+func TestReloadProvider_RetainLiveKeysKeepsLastGood(t *testing.T) {
+	catalog := modelcatalog.NewTestCatalog(nil)
+	catalog.UpsertLive("custom-provider", "key-1", false, []string{"old-model"})
+	catalog.UpsertLive("custom-provider", "key-2", false, []string{"other-model"})
+
+	// Mirrors the keep map ReloadProvider builds for enabled keys only.
+	catalog.RetainLiveKeys("custom-provider", map[string]struct{}{"key-2": {}})
+
+	got := catalog.GetModelsForProvider("custom-provider")
+	slices.Sort(got)
+	want := []string{"other-model"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("after RetainLiveKeys, GetModelsForProvider = %v, want %v", got, want)
+	}
+}
+
+// TestReloadProvider_NoKeysClearsLiveCatalog covers the hasNoKeys branch:
+// when a provider ends up with zero keys, ReloadProvider must still wipe its
+// live entries (there is nothing left to serve) without requiring a client.
+func TestReloadProvider_NoKeysClearsLiveCatalog(t *testing.T) {
+	prevLogger := logger
+	logger = noopTestLogger{}
+	defer func() { logger = prevLogger }()
+
+	catalog := modelcatalog.NewTestCatalog(nil)
+	catalog.UpsertLive("custom-provider", "key-1", false, []string{"some-model"})
+
+	server := &BifrostHTTPServer{
+		// ReloadProvider rejects a nil Client before the discovery branch and
+		// reads governance plugin name from Ctx. The no-keys path never invokes
+		// Client methods, so a zero Bifrost + empty BifrostContext is enough.
+		Ctx:    schemas.NewBifrostContext(context.Background(), schemas.NoDeadline),
+		Client: &bifrost.Bifrost{},
+		Config: &lib.Config{
+			ModelCatalog: catalog,
+			ConfigStore: &reloadProviderConfigStore{
+				provider: &tables.TableProvider{Name: "custom-provider"},
+			},
+			Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
+				"custom-provider": {Keys: nil},
+			},
+		},
+	}
+
+	if _, err := server.ReloadProvider(context.Background(), "custom-provider"); err != nil {
+		t.Fatalf("ReloadProvider returned unexpected error: %v", err)
+	}
+	if models := server.Config.ModelCatalog.GetModelsForProvider("custom-provider"); len(models) != 0 {
+		t.Fatalf("expected live catalog cleared when no keys configured, got %v", models)
 	}
 }
 

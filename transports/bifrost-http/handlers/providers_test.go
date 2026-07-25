@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -1721,5 +1722,36 @@ func TestRefreshListModels_UnsetProviderListStillFansOut(t *testing.T) {
 	listAllModelsCacheMu.Unlock()
 	if entry != nil && entry.resp != nil {
 		t.Fatalf("unscoped request must not be cached as an empty catalog")
+	}
+}
+
+// TestInvalidateListModelsCache_DropsAllEntries ensures a provider/key reload
+// can force the next GET /v1/models to re-fan-out instead of serving a still-
+// fresh 5-minute TTL entry that was populated before the upstream catalog
+// changed. Without this, PUT /api/providers/{name} re-discovers live models
+// but the public list endpoint keeps reporting the pre-reload snapshot.
+func TestInvalidateListModelsCache_DropsAllEntries(t *testing.T) {
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk-1:omp-gw:false": {
+			resp: &schemas.BifrostListModelsResponse{
+				Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+			},
+			at: time.Now(),
+		},
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(func() {
+		listAllModelsCacheMu.Lock()
+		listAllModelsCache = map[string]*listAllModelsCacheEntry{}
+		listAllModelsCacheMu.Unlock()
+	})
+
+	InvalidateListModelsCache()
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if len(listAllModelsCache) != 0 {
+		t.Fatalf("expected empty listAllModelsCache after InvalidateListModelsCache, got %#v", listAllModelsCache)
 	}
 }

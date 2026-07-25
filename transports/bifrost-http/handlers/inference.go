@@ -1285,6 +1285,17 @@ var (
 	listAllModelsCache   = map[string]*listAllModelsCacheEntry{}
 )
 
+// InvalidateListModelsCache drops the short-lived GET /v1/models response
+// cache. Provider/key reloads refresh the live catalog, but listModelsCached
+// would keep serving a still-fresh 5-minute entry until TTL expiry — so a
+// successful re-discovery would look like a no-op until the process restarts.
+// Safe to call with no active entries.
+func InvalidateListModelsCache() {
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{}
+	listAllModelsCacheMu.Unlock()
+}
+
 // listModelsCached serves GET /v1/models lists from a short
 // TTL cache. A stale entry is served immediately while a background refresh
 // runs; the first (cold) request blocks until the initial fill completes. The

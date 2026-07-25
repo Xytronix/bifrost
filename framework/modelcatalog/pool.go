@@ -35,6 +35,13 @@ func (mc *ModelCatalog) InvalidateLiveProvider(provider schemas.ModelProvider) {
 	mc.live.InvalidateProvider(provider)
 }
 
+// RetainLiveKeys drops live entries for the provider whose key IDs are not
+// in keep. Prefer this over InvalidateLiveProvider before a re-discovery so
+// a failed refetch leaves the last-good catalog for still-configured keys.
+func (mc *ModelCatalog) RetainLiveKeys(provider schemas.ModelProvider, keep map[string]struct{}) {
+	mc.live.RetainKeys(provider, keep)
+}
+
 // SetKeyConfigForProvider replaces the keyconfig snapshot for one provider.
 func (mc *ModelCatalog) SetKeyConfigForProvider(provider schemas.ModelProvider, keys []schemas.Key) {
 	mc.keyconf.SetProvider(provider, keys)

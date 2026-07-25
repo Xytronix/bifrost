@@ -668,15 +668,30 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 	isKeylessProvider := providerInfo.CustomProviderConfig != nil && providerInfo.CustomProviderConfig.IsKeyLess
 	hasNoKeys := len(inMemoryKeys) == 0 && !isKeylessProvider
 
-	// Refresh keyconfig from the current key list, then drop any stale live
-	// entries (for keys removed in this update) before refetching per-key.
+	// Refresh keyconfig from the current key list. Do NOT wipe the whole live
+	// catalog before refetching: a failed list-models leaves the last-good
+	// models in place (UpsertLive only writes on success). Only prune entries
+	// for keys that are gone or disabled so routing never serves a removed key.
 	s.Config.ModelCatalog.SetKeyConfigForProvider(provider, inMemoryKeys)
-	s.Config.ModelCatalog.InvalidateLiveProvider(provider)
 	if hasNoKeys {
+		s.Config.ModelCatalog.InvalidateLiveProvider(provider)
 		logger.Warn("model discovery skipped for provider %s: no keys configured", provider)
 	} else {
+		keep := make(map[string]struct{}, len(inMemoryKeys)+1)
+		if isKeylessProvider {
+			keep[""] = struct{}{}
+		}
+		for _, key := range inMemoryKeys {
+			if keyEnabled(key) {
+				keep[key.ID] = struct{}{}
+			}
+		}
+		s.Config.ModelCatalog.RetainLiveKeys(provider, keep)
 		s.RefreshLiveModelsForProvider(ctx, provider, inMemoryKeys)
 	}
+	// Drop the GET /v1/models TTL cache so the next list request re-fans-out
+	// against the (possibly just-refreshed) upstream catalogs.
+	handlers.InvalidateListModelsCache()
 	return updatedProvider, nil
 }
 
@@ -702,6 +717,7 @@ func (s *BifrostHTTPServer) RemoveProvider(ctx context.Context, provider schemas
 	}
 	s.Config.ModelCatalog.InvalidateLiveProvider(provider)
 	s.Config.ModelCatalog.RemoveKeyConfigForProvider(provider)
+	handlers.InvalidateListModelsCache()
 
 	return nil
 }
@@ -730,6 +746,7 @@ func (s *BifrostHTTPServer) OnKeyAdded(ctx context.Context, provider schemas.Mod
 		return nil
 	}
 	s.FetchAndStoreLiveForKey(ctx, provider, keyID)
+	handlers.InvalidateListModelsCache()
 	return nil
 }
 
@@ -749,13 +766,17 @@ func (s *BifrostHTTPServer) OnKeyUpdated(ctx context.Context, provider schemas.M
 	if isKeylessProvider(provider, s.Config) {
 		keyID = ""
 	}
-	s.Config.ModelCatalog.InvalidateLive(provider, keyID)
-	// Skip the fetch for a disabled key — the invalidate above still clears
-	// its stale cached entries, but re-fetching would just fail against core.
+	// Disabled keys: drop stale live entries without refetching (core would
+	// reject a scoped list-models). Enabled keys keep last-good until the
+	// refetch Upsert succeeds, so a failed re-discovery does not blank the
+	// catalog.
 	if !keyEnabled(key) {
+		s.Config.ModelCatalog.InvalidateLive(provider, keyID)
+		handlers.InvalidateListModelsCache()
 		return nil
 	}
 	s.FetchAndStoreLiveForKey(ctx, provider, keyID)
+	handlers.InvalidateListModelsCache()
 	return nil
 }
 
@@ -772,6 +793,7 @@ func (s *BifrostHTTPServer) OnKeyDeleted(ctx context.Context, provider schemas.M
 	}
 	s.Config.ModelCatalog.SetKeyConfigForProvider(provider, keys)
 	s.Config.ModelCatalog.InvalidateLive(provider, keyID)
+	handlers.InvalidateListModelsCache()
 	return nil
 }
 
