@@ -1113,19 +1113,34 @@ func modelResolutionCandidates(model string) []string {
 
 // fallbackEntryForModel resolves a custom/aggregator model to a base-name
 // capability+pricing entry by walking modelResolutionCandidates.
+//
+// A priced entry wins outright. Catalog rows can carry capabilities without a
+// rate — models.dev knows plenty of context windows it has no price for, and a
+// seat-included model is published with no rate at all — so stopping at the
+// first hit would pin such a model to $0 and never reach the vendor-qualified
+// candidate that does carry its rate. Keep walking, and fall back to the first
+// metadata-only entry when nothing priced turns up.
 func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *modelcatalog.ModelCatalog, model string) *modelcatalog.PricingEntry {
 	seen := map[string]bool{}
+	var metadataOnly *modelcatalog.PricingEntry
 	for _, cand := range modelResolutionCandidates(model) {
 		base := catalog.BaseModelName(cand)
 		if base == "" || seen[base] {
 			continue
 		}
 		seen[base] = true
-		if e := idx[base]; e != nil {
-			return e
+		entry := idx[base]
+		if entry == nil {
+			continue
+		}
+		if entry.InputCostPerToken != nil || entry.OutputCostPerToken != nil {
+			return entry
+		}
+		if metadataOnly == nil {
+			metadataOnly = entry
 		}
 	}
-	return nil
+	return metadataOnly
 }
 
 // supportedParamsForModel resolves a model's OpenAI-compatible supported

@@ -1622,3 +1622,41 @@ func TestListModels_KeyBlacklistIsCaseInsensitive(t *testing.T) {
 		}
 	}
 }
+
+func TestFallbackEntryForModel_PrefersPricedOverMetadataOnly(t *testing.T) {
+	// The catalog can know a model's context window without knowing its rate
+	// (models.dev publishes plenty, and a seat-included model has none). The
+	// walk must not stop on that row and pin the model to $0 — it has to keep
+	// going to the vendor-qualified candidate that does carry a rate, while
+	// still using the metadata-only row when nothing priced exists.
+	schemas.RegisterKnownProvider("omp-gw")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("omp-gw") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"k3": {"provider":"kimi","mode":"chat","base_model":"k3","max_input_tokens":1048576},
+		"kimi-k3": {"provider":"moonshot","mode":"chat","base_model":"kimi-k3","max_input_tokens":1048576,"input_cost_per_token":0.000003,"output_cost_per_token":0.000015},
+		"orphan-model": {"provider":"someone","mode":"chat","base_model":"orphan-model","max_input_tokens":32000}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/kimi-code/k3"},
+		{ID: "omp-gw/kimi-code/orphan-model"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+	k3 := byID["omp-gw/kimi-code/k3"]
+	if k3.Pricing == nil || k3.Pricing.Prompt == nil {
+		t.Fatalf("must walk past the unpriced k3 row to kimi-k3, got %#v", k3.Pricing)
+	}
+	if *k3.Pricing.Prompt != "0.0000030000" {
+		t.Fatalf("prompt price should match kimi-k3, got %q", *k3.Pricing.Prompt)
+	}
+	orphan := byID["omp-gw/kimi-code/orphan-model"]
+	if orphan.ContextLength == nil || *orphan.ContextLength != 32000 {
+		t.Fatalf("metadata-only row must still enrich context, got %#v", orphan.ContextLength)
+	}
+}
