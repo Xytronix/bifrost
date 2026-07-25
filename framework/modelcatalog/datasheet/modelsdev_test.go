@@ -18,13 +18,19 @@ const modelsDevSample = `{
     "anthropic/claude-sonnet-4-6": {
       "id": "anthropic/claude-sonnet-4-6",
       "limit": {"context": 1000000, "output": 128000},
-      "modalities": {"input": ["text","image","pdf"], "output": ["text"]}
+      "modalities": {"input": ["text","image","pdf"], "output": ["text"]},
+      "reasoning": true,
+      "reasoning_options": [{"type": "toggle"}, {"type": "effort", "values": ["low","medium","high","xhigh","max"]}]
     },
     "moonshotai/k3": {
       "id": "moonshotai/k3",
       "limit": {"context": 256000}
     },
-    "someone/no-limit-no-price": {"id": "someone/no-limit-no-price"}
+    "someone/no-limit-no-price": {
+      "id": "someone/no-limit-no-price",
+      "reasoning": true,
+      "reasoning_options": [{"type": "effort", "values": ["low","high"]}]
+    }
   },
   "providers": {
     "anthropic": {
@@ -57,8 +63,9 @@ const modelsDevSample = `{
 }`
 
 func TestParseModelsDev_CanonicalMetadataWinsProviderPricingFillsIn(t *testing.T) {
-	entries, err := parseModelsDev([]byte(modelsDevSample))
+	data, err := parseModelsDev([]byte(modelsDevSample))
 	require.NoError(t, err)
+	entries := data.Entries
 
 	sonnet, ok := entries["claude-sonnet-4-6"]
 	require.True(t, ok, "canonical id must be keyed bare, without the lab prefix")
@@ -95,13 +102,20 @@ func TestParseModelsDev_CanonicalMetadataWinsProviderPricingFillsIn(t *testing.T
 	// Nothing to contribute at all.
 	_, hasEmpty := entries["no-limit-no-price"]
 	assert.False(t, hasEmpty, "entry with neither rate nor limit must be dropped")
+
+	// Effort ladders are keyed the same way and are NOT subject to that prune:
+	// the thinking scale is worth publishing even for a model bifrost has no
+	// rate or limit for.
+	assert.Equal(t, []string{"low", "medium", "high", "xhigh", "max"}, data.Efforts["claude-sonnet-4-6"])
+	assert.Equal(t, []string{"low", "high"}, data.Efforts["no-limit-no-price"])
+	assert.Empty(t, data.Efforts["k3"], "a model with no effort-typed reasoning option has no ladder")
 }
 
 func TestParseModelsDev_AcceptsBareProviderPayload(t *testing.T) {
 	// /api.json has no "models" key; every entry then comes from the providers.
-	entries, err := parseModelsDev([]byte(`{"google":{"models":{"gemini-3.6-flash":{"id":"gemini-3.6-flash","cost":{"input":1.5,"output":7.5}}}}}`))
+	data, err := parseModelsDev([]byte(`{"google":{"models":{"gemini-3.6-flash":{"id":"gemini-3.6-flash","cost":{"input":1.5,"output":7.5}}}}}`))
 	require.NoError(t, err)
-	assert.Empty(t, entries, "a provider-keyed payload has no catalog envelope, so nothing is read")
+	assert.Empty(t, data.Entries, "a provider-keyed payload has no catalog envelope, so nothing is read")
 }
 
 func newOverlayStore(t *testing.T, body string) (*Store, func()) {

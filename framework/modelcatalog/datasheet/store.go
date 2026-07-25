@@ -73,6 +73,7 @@ type Store struct {
 	baseModelIndex         map[string]string                              // model → canonical base name
 	supportedResponseTypes map[string][]string                            // model → [chat_completion, responses, …]
 	supportedParams        map[string][]string                            // model → [temperature, top_p, …]
+	modelsDevEfforts       map[string][]string                            // model → wire reasoning-effort tiers (models.dev overlay)
 	datasheetByProvider    map[schemas.ModelProvider][]string             // rebuilt every reload
 	deprecatedByProvider   map[schemas.ModelProvider][]string             // rebuilt every reload
 
@@ -375,6 +376,26 @@ func (s *Store) GetSupportedParameters(model string) []string {
 	}
 	out := make([]string, len(params))
 	copy(out, params)
+	return out
+}
+
+// GetReasoningEfforts returns the model's wire reasoning-effort tiers as
+// published by models.dev, or nil when it is unknown there or exposes no
+// effort-addressed thinking.
+//
+// Deliberately separate from GetSupportedParameters: that list doubles as the
+// compat plugin's request-parameter allowlist, so a models.dev-only entry
+// there would make every unlisted parameter (temperature, tools, …) look
+// unsupported. This is metadata for catalog consumers only.
+func (s *Store) GetReasoningEfforts(model string) []string {
+	s.mu.RLock()
+	efforts, ok := s.modelsDevEfforts[model]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(efforts))
+	copy(out, efforts)
 	return out
 }
 

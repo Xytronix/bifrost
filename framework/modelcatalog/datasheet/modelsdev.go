@@ -52,6 +52,23 @@ type modelsDevModel struct {
 		Input  []string `json:"input"`
 		Output []string `json:"output"`
 	} `json:"modalities"`
+	// ReasoningOptions enumerates how thinking is addressed. The
+	// `type: "effort"` option carries the model's COMPLETE wire effort ladder
+	// (`["low","medium","high","xhigh","max"]`), which the upstream datasheet
+	// only ever describes as a handful of supports_*_reasoning_effort flags
+	// naming the tiers beyond low/medium/high.
+	ReasoningOptions []struct {
+		Type   string   `json:"type"`
+		Values []string `json:"values"`
+	} `json:"reasoning_options"`
+}
+
+// modelsDevData is the converted catalog: pricing/capability entries plus the
+// effort ladders, which are keyed the same way but consumed separately (they
+// must never reach the compat plugin's supported-parameter allowlist).
+type modelsDevData struct {
+	Entries map[string]Entry
+	Efforts map[string][]string
 }
 
 // applyModelsDevOverlay adds models.dev entries for ids the datasheet does not
@@ -66,13 +83,14 @@ type modelsDevModel struct {
 //
 // Caller must NOT hold s.mu.
 func (s *Store) applyModelsDevOverlay(ctx context.Context) {
-	entries := s.modelsDevEntries(ctx)
+	data := s.modelsDevData(ctx)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.rebuildDatasheetViewUnsafe()
 
-	if len(entries) == 0 {
+	s.modelsDevEfforts = data.Efforts
+	if len(data.Entries) == 0 {
 		return
 	}
 	covered := make(map[string]struct{}, len(s.pricingData))
@@ -80,7 +98,7 @@ func (s *Store) applyModelsDevOverlay(ctx context.Context) {
 		covered[strings.ToLower(pricing.Model)] = struct{}{}
 	}
 	added := 0
-	for id, entry := range entries {
+	for id, entry := range data.Entries {
 		if _, ok := covered[strings.ToLower(id)]; ok {
 			continue
 		}
@@ -89,29 +107,29 @@ func (s *Store) applyModelsDevOverlay(ctx context.Context) {
 		added++
 	}
 	if s.logger != nil {
-		s.logger.Debug("models.dev overlay added %d entries the datasheet did not cover", added)
+		s.logger.Debug("models.dev overlay added %d entries the datasheet did not cover, %d effort ladders", added, len(data.Efforts))
 	}
 }
 
-// modelsDevEntries returns the converted catalog, or nil when the overlay is
-// off or unavailable. A file: primary URL means a local or test datasheet, so
-// we never reach out to the network behind the caller's back.
-func (s *Store) modelsDevEntries(ctx context.Context) map[string]Entry {
+// modelsDevData returns the converted catalog, or the zero value when the
+// overlay is off or unavailable. A file: primary URL means a local or test
+// datasheet, so we never reach out to the network behind the caller's back.
+func (s *Store) modelsDevData(ctx context.Context) modelsDevData {
 	s.syncCfgMu.RLock()
 	primaryURL, modelsDevURL := s.url, s.modelsDevURL
 	s.syncCfgMu.RUnlock()
 
 	if modelsDevURL == "" || strings.HasPrefix(primaryURL, "file:") {
-		return nil
+		return modelsDevData{}
 	}
-	entries, err := cachedModelsDev(ctx, modelsDevURL)
+	data, err := cachedModelsDev(ctx, modelsDevURL)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Warn("models.dev catalog unavailable, using datasheet only: %v", err)
 		}
-		return nil
+		return modelsDevData{}
 	}
-	return entries
+	return data
 }
 
 // modelsDevMemoTTL bounds how long a fetched catalog is reused. The overlay
@@ -120,52 +138,52 @@ func (s *Store) modelsDevEntries(ctx context.Context) map[string]Entry {
 const modelsDevMemoTTL = time.Hour
 
 var modelsDevMemo struct {
-	mu      sync.Mutex
-	url     string
-	at      time.Time
-	entries map[string]Entry
+	mu   sync.Mutex
+	url  string
+	at   time.Time
+	data modelsDevData
 }
 
 // cachedModelsDev returns the converted catalog, fetching it at most once per
-// modelsDevMemoTTL per URL. The returned map is shared and MUST NOT be mutated.
-func cachedModelsDev(ctx context.Context, rawURL string) (map[string]Entry, error) {
+// modelsDevMemoTTL per URL. The returned maps are shared and MUST NOT be mutated.
+func cachedModelsDev(ctx context.Context, rawURL string) (modelsDevData, error) {
 	modelsDevMemo.mu.Lock()
 	defer modelsDevMemo.mu.Unlock()
-	if modelsDevMemo.entries != nil && modelsDevMemo.url == rawURL &&
+	if modelsDevMemo.data.Entries != nil && modelsDevMemo.url == rawURL &&
 		time.Since(modelsDevMemo.at) < modelsDevMemoTTL {
-		return modelsDevMemo.entries, nil
+		return modelsDevMemo.data, nil
 	}
-	entries, err := fetchModelsDev(ctx, rawURL)
+	data, err := fetchModelsDev(ctx, rawURL)
 	if err != nil {
-		return nil, err
+		return modelsDevData{}, err
 	}
 	modelsDevMemo.url = rawURL
 	modelsDevMemo.at = time.Now()
-	modelsDevMemo.entries = entries
-	return entries, nil
+	modelsDevMemo.data = data
+	return data, nil
 }
 
 // fetchModelsDev downloads and converts the models.dev catalog.
-func fetchModelsDev(ctx context.Context, rawURL string) (map[string]Entry, error) {
+func fetchModelsDev(ctx context.Context, rawURL string) (modelsDevData, error) {
 	if err := bifrost.ValidateExternalURL(rawURL, true); err != nil {
-		return nil, fmt.Errorf("models.dev URL validation failed: %w", err)
+		return modelsDevData{}, fmt.Errorf("models.dev URL validation failed: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create models.dev request: %w", err)
+		return modelsDevData{}, fmt.Errorf("failed to create models.dev request: %w", err)
 	}
 	client := &http.Client{Timeout: DefaultPricingTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download models.dev catalog: %w", err)
+		return modelsDevData{}, fmt.Errorf("failed to download models.dev catalog: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download models.dev catalog: HTTP %d", resp.StatusCode)
+		return modelsDevData{}, fmt.Errorf("failed to download models.dev catalog: HTTP %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read models.dev response: %w", err)
+		return modelsDevData{}, fmt.Errorf("failed to read models.dev response: %w", err)
 	}
 	return parseModelsDev(data)
 }
@@ -178,13 +196,14 @@ func fetchModelsDev(ctx context.Context, rawURL string) (map[string]Entry, error
 //
 // A bare /api.json payload (no "models" key) still parses: the canonical half
 // is simply empty and every entry comes from the provider views.
-func parseModelsDev(data []byte) (map[string]Entry, error) {
+func parseModelsDev(data []byte) (modelsDevData, error) {
 	var catalog modelsDevCatalog
 	if err := sonic.Unmarshal(data, &catalog); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal models.dev catalog: %w", err)
+		return modelsDevData{}, fmt.Errorf("failed to unmarshal models.dev catalog: %w", err)
 	}
 
 	out := make(map[string]Entry, len(catalog.Models))
+	efforts := make(map[string][]string, len(catalog.Models))
 
 	// Canonical first: authoritative capabilities and limits, no provider guess.
 	for canonicalID, model := range catalog.Models {
@@ -193,6 +212,9 @@ func parseModelsDev(data []byte) (map[string]Entry, error) {
 			continue
 		}
 		out[id] = modelsDevEntry("", model)
+		if ladder := modelsDevEffortLadder(model); len(ladder) > 0 {
+			efforts[id] = ladder
+		}
 	}
 
 	// Provider views supply the rates, and any model the canonical half omits.
@@ -209,6 +231,11 @@ func parseModelsDev(data []byte) (map[string]Entry, error) {
 			id := bareModelID(modelID, model.ID)
 			if id == "" {
 				continue
+			}
+			if _, ok := efforts[id]; !ok {
+				if ladder := modelsDevEffortLadder(model); len(ladder) > 0 {
+					efforts[id] = ladder
+				}
 			}
 			priced := modelsDevEntry(providerID, model)
 			existing, ok := out[id]
@@ -241,7 +268,23 @@ func parseModelsDev(data []byte) (map[string]Entry, error) {
 			delete(out, id)
 		}
 	}
-	return out, nil
+	// Effort ladders survive that prune: a model with neither a rate nor a
+	// context limit enriches nothing pricing-wise but its thinking scale is
+	// still the only published description of the wire contract.
+	return modelsDevData{Entries: out, Efforts: efforts}, nil
+}
+
+// modelsDevEffortLadder returns the model's wire effort tiers, or nil when it
+// exposes no effort-addressed thinking (non-reasoning models, and reasoning
+// models addressed only by a toggle or a token budget).
+func modelsDevEffortLadder(model modelsDevModel) []string {
+	for _, opt := range model.ReasoningOptions {
+		if opt.Type != "effort" || len(opt.Values) == 0 {
+			continue
+		}
+		return append([]string(nil), opt.Values...)
+	}
+	return nil
 }
 
 // bareModelID strips a canonical "lab/model" prefix. The datasheet and every

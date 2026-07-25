@@ -977,6 +977,16 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 				}
 			}
 		}
+		// models.dev publishes the model's COMPLETE wire effort ladder, while
+		// the upstream datasheet only flags the tiers beyond low/medium/high.
+		// Where the vendor lookup knows a model, its ladder is authoritative.
+		efforts := reasoningEffortsForModel(catalog, modelName)
+		if len(efforts) == 0 && modelEntry.Alias != nil {
+			efforts = reasoningEffortsForModel(catalog, *modelEntry.Alias)
+		}
+		if len(efforts) > 0 {
+			modelEntry.SupportedParameters = withReasoningEffortTiers(modelEntry.SupportedParameters, efforts)
+		}
 		resp.Data[i] = modelEntry
 	}
 }
@@ -1161,6 +1171,51 @@ func supportedParamsForModel(catalog *modelcatalog.ModelCatalog, model string) [
 		}
 	}
 	return nil
+}
+
+// reasoningEffortsForModel resolves a model's wire effort ladder from the
+// models.dev overlay, walking the same candidate forms as
+// supportedParamsForModel so aggregator and effort-suffixed aliases
+// ("omp-gw/anthropic/claude-opus-5", "claude-opus-5-high") reach the base model.
+func reasoningEffortsForModel(catalog *modelcatalog.ModelCatalog, model string) []string {
+	seen := map[string]bool{}
+	for _, cand := range modelResolutionCandidates(model) {
+		for _, name := range []string{cand, catalog.BaseModelName(cand)} {
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			if efforts := catalog.GetReasoningEfforts(name); len(efforts) > 0 {
+				return efforts
+			}
+		}
+	}
+	return nil
+}
+
+// withReasoningEffortTiers replaces any datasheet-derived reasoning_effort:*
+// tokens with the vendor ladder, keeping every other supported parameter. A
+// model that advertises an effort scale reasons by definition, so `reasoning`
+// is implied.
+func withReasoningEffortTiers(params []string, efforts []string) []string {
+	out := make([]string, 0, len(params)+len(efforts)+1)
+	hasReasoning := false
+	for _, p := range params {
+		if strings.HasPrefix(p, "reasoning_effort:") {
+			continue
+		}
+		if p == "reasoning" {
+			hasReasoning = true
+		}
+		out = append(out, p)
+	}
+	if !hasReasoning {
+		out = append(out, "reasoning")
+	}
+	for _, effort := range efforts {
+		out = append(out, "reasoning_effort:"+effort)
+	}
+	return out
 }
 
 // lastPathSegment returns the substring after the final "/", dropping an inner

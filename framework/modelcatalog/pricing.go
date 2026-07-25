@@ -27,6 +27,12 @@ func (mc *ModelCatalog) GetSupportedParameters(model string) []string {
 	return mc.datasheet.GetSupportedParameters(model)
 }
 
+// GetReasoningEfforts returns the model's published wire reasoning-effort
+// tiers (models.dev overlay), or nil when unknown.
+func (mc *ModelCatalog) GetReasoningEfforts(model string) []string {
+	return mc.datasheet.GetReasoningEfforts(model)
+}
+
 func (mc *ModelCatalog) IsTextCompletionSupported(model string, provider schemas.ModelProvider) bool {
 	return mc.datasheet.IsTextCompletionSupported(model, provider)
 }
