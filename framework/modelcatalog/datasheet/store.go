@@ -27,8 +27,15 @@ const (
 type Config struct {
 	URL                string
 	ModelParametersURL string
-	SyncInterval       time.Duration
+	// ModelsDevURL is the community catalog merged UNDER the datasheet to
+	// cover models it has not published yet. Empty falls back to
+	// DefaultModelsDevURL; ModelsDevDisabled turns the merge off entirely.
+	ModelsDevURL string
+	SyncInterval time.Duration
 }
+
+// ModelsDevDisabled opts a deployment out of the models.dev gap fill.
+const ModelsDevDisabled = "off"
 
 func (c Config) resolved() Config {
 	if c.URL == "" {
@@ -36,6 +43,12 @@ func (c Config) resolved() Config {
 	}
 	if c.ModelParametersURL == "" {
 		c.ModelParametersURL = DefaultModelParametersURL
+	}
+	switch c.ModelsDevURL {
+	case "":
+		c.ModelsDevURL = DefaultModelsDevURL
+	case ModelsDevDisabled:
+		c.ModelsDevURL = ""
 	}
 	if c.SyncInterval <= 0 {
 		c.SyncInterval = DefaultSyncInterval
@@ -76,6 +89,7 @@ type Store struct {
 	syncCfgMu          sync.RWMutex
 	url                string
 	modelParametersURL string
+	modelsDevURL       string
 	syncInterval       time.Duration
 	lastSyncedAt       time.Time
 }
@@ -95,6 +109,7 @@ func New(configStore configstore.ConfigStore, logger schemas.Logger, cfg Config)
 		deprecatedByProvider:   make(map[schemas.ModelProvider][]string),
 		url:                    cfg.URL,
 		modelParametersURL:     cfg.ModelParametersURL,
+		modelsDevURL:           cfg.ModelsDevURL,
 		syncInterval:           cfg.SyncInterval,
 	}
 }
@@ -106,6 +121,7 @@ func (s *Store) UpdateSyncConfig(cfg Config) {
 	s.syncCfgMu.Lock()
 	s.url = cfg.URL
 	s.modelParametersURL = cfg.ModelParametersURL
+	s.modelsDevURL = cfg.ModelsDevURL
 	s.syncInterval = cfg.SyncInterval
 	s.syncCfgMu.Unlock()
 }

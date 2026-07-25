@@ -1004,6 +1004,83 @@ func (s *BifrostHTTPServer) UpdateSyncConfig(ctx context.Context) error {
 	return s.Config.ModelCatalog.UpdateSyncConfig(ctx, s.Config.FrameworkConfig.Pricing)
 }
 
+// defaultLiveModelRefreshInterval is how often every provider's list-models is
+// re-fetched into the live catalog. Without a periodic pass the catalog is only
+// ever filled at bootstrap and on key edits, so a model a provider starts
+// serving afterwards stays invisible until the gateway restarts — which is how
+// local shims (whose own upstream catalogs refresh every ~10 minutes) end up
+// looking stale. Override with BIFROST_LIVE_MODELS_REFRESH_INTERVAL (a Go
+// duration); "0" or "off" disables the refresher.
+const defaultLiveModelRefreshInterval = 15 * time.Minute
+
+// liveModelRefreshInterval resolves the configured refresh period. An
+// unparseable value falls back to the default rather than disabling the
+// refresher, so a typo cannot silently freeze the catalog; the caller logs the
+// resolved interval so the fallback is still visible.
+func liveModelRefreshInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("BIFROST_LIVE_MODELS_REFRESH_INTERVAL"))
+	switch raw {
+	case "":
+		return defaultLiveModelRefreshInterval
+	case "0", "off":
+		return 0
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed <= 0 {
+		return defaultLiveModelRefreshInterval
+	}
+	return parsed
+}
+
+// RefreshAllLiveModels re-fetches list-models for every configured provider in
+// parallel. Reads the provider set through the store accessors so it is safe to
+// call while the server is live and providers are being edited.
+func (s *BifrostHTTPServer) RefreshAllLiveModels(ctx context.Context) {
+	if s.Config == nil || s.Config.ModelCatalog == nil {
+		return
+	}
+	providers, err := s.Config.GetAllProviders()
+	if err != nil {
+		logger.Warn("live model refresh skipped: %v", err)
+		return
+	}
+	var wg sync.WaitGroup
+	for _, provider := range providers {
+		providerConfig, err := s.Config.GetProviderConfigRaw(provider)
+		if err != nil || providerConfig == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(p schemas.ModelProvider, keys []schemas.Key) {
+			defer wg.Done()
+			s.RefreshLiveModelsForProvider(ctx, p, keys)
+		}(provider, providerConfig.Keys)
+	}
+	wg.Wait()
+}
+
+// startLiveModelRefresher runs RefreshAllLiveModels on a ticker until ctx ends.
+func (s *BifrostHTTPServer) startLiveModelRefresher(ctx context.Context) {
+	interval := liveModelRefreshInterval()
+	if interval <= 0 {
+		logger.Info("periodic live model refresh disabled")
+		return
+	}
+	logger.Info("refreshing live model catalog every %v", interval)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.RefreshAllLiveModels(ctx)
+			}
+		}
+	}()
+}
+
 // RefreshLiveModelsForProvider runs filtered + unfiltered list-models for the
 // provider, fanning out per key in parallel so the live cache ends up with
 // per-(provider, keyID) entries. Keyless providers cache under the "" sentinel.
@@ -1861,15 +1938,9 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		}
 		s.Config.ModelCatalog.ReplaceKeyConfig(snapshot)
 
-		var wg sync.WaitGroup
-		for provider, providerConfig := range s.Config.Providers {
-			wg.Add(1)
-			go func(p schemas.ModelProvider, keys []schemas.Key) {
-				defer wg.Done()
-				s.RefreshLiveModelsForProvider(ctx, p, keys)
-			}(provider, providerConfig.Keys)
-		}
-		wg.Wait()
+		s.RefreshAllLiveModels(ctx)
+		// Providers keep adding models after boot; keep the catalog current.
+		s.startLiveModelRefresher(ctx)
 	}
 	logger.Info("models added to catalog")
 	s.Config.SetBifrostClient(s.Client)

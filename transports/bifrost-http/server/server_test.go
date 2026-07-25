@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
@@ -507,4 +508,37 @@ func TestMarshalPluginConfig_WithComplexType(t *testing.T) {
 	if result.Nested.Name != "nested-config" {
 		t.Errorf("Expected nested name=nested-config, got %s", result.Nested.Name)
 	}
+}
+
+// TestLiveModelRefreshInterval pins the refresher's configuration contract: a
+// typo must not silently freeze the catalog, and only an explicit off switch
+// disables the periodic pass.
+func TestLiveModelRefreshInterval(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want time.Duration
+	}{
+		{name: "unset uses default", env: "", want: defaultLiveModelRefreshInterval},
+		{name: "explicit duration", env: "90s", want: 90 * time.Second},
+		{name: "whitespace tolerated", env: "  5m  ", want: 5 * time.Minute},
+		{name: "off disables", env: "off", want: 0},
+		{name: "zero disables", env: "0", want: 0},
+		{name: "garbage falls back", env: "soon", want: defaultLiveModelRefreshInterval},
+		{name: "negative falls back", env: "-5m", want: defaultLiveModelRefreshInterval},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BIFROST_LIVE_MODELS_REFRESH_INTERVAL", tc.env)
+			if got := liveModelRefreshInterval(); got != tc.want {
+				t.Fatalf("liveModelRefreshInterval() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRefreshAllLiveModelsWithoutCatalogIsNoop guards the background ticker:
+// it must not panic when the catalog was never wired.
+func TestRefreshAllLiveModelsWithoutCatalogIsNoop(t *testing.T) {
+	(&BifrostHTTPServer{}).RefreshAllLiveModels(context.Background())
+	(&BifrostHTTPServer{Config: &lib.Config{}}).RefreshAllLiveModels(context.Background())
 }

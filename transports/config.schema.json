@@ -3509,6 +3509,11 @@
           "optional": true,
           "format": "uri"
         },
+        "models_dev_url": {
+          "type": "string",
+          "description": "Community model catalog merged under the pricing datasheet to cover models it has not published yet. Leave empty for the default (https://models.dev/api.json); set to \"off\" to disable.",
+          "optional": true
+        },
         "mcp_library_url": {
           "type": "string",
           "description": "URL to a custom MCP server catalog. Leave empty to use the default Bifrost catalog.",

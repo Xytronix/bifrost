@@ -61,6 +61,10 @@ func Init(ctx context.Context, config *Config, configStore configstore.ConfigSto
 	if config != nil && config.ModelParametersURL != nil && *config.ModelParametersURL != "" {
 		modelParametersURL = *config.ModelParametersURL
 	}
+	modelsDevURL := ""
+	if config != nil && config.ModelsDevURL != nil {
+		modelsDevURL = *config.ModelsDevURL
+	}
 	mcpLibraryURL := DefaultMCPLibraryURL
 	if config != nil && config.MCPLibraryURL != nil && *config.MCPLibraryURL != "" {
 		mcpLibraryURL = *config.MCPLibraryURL
@@ -87,6 +91,7 @@ func Init(ctx context.Context, config *Config, configStore configstore.ConfigSto
 		datasheet: datasheet.New(configStore, logger, datasheet.Config{
 			URL:                pricingURL,
 			ModelParametersURL: modelParametersURL,
+			ModelsDevURL:       modelsDevURL,
 			SyncInterval:       syncInterval,
 		}),
 		live:    live.New(logger),
@@ -303,6 +308,10 @@ func (mc *ModelCatalog) UpdateSyncConfig(ctx context.Context, config *Config) er
 	if config != nil && config.ModelParametersURL != nil && *config.ModelParametersURL != "" {
 		modelParametersURL = *config.ModelParametersURL
 	}
+	modelsDevURL := ""
+	if config != nil && config.ModelsDevURL != nil {
+		modelsDevURL = *config.ModelsDevURL
+	}
 	mcpLibraryURL := DefaultMCPLibraryURL
 	if config != nil && config.MCPLibraryURL != nil && *config.MCPLibraryURL != "" {
 		mcpLibraryURL = *config.MCPLibraryURL
@@ -323,6 +332,7 @@ func (mc *ModelCatalog) UpdateSyncConfig(ctx context.Context, config *Config) er
 	mc.datasheet.UpdateSyncConfig(datasheet.Config{
 		URL:                pricingURL,
 		ModelParametersURL: modelParametersURL,
+		ModelsDevURL:       modelsDevURL,
 		SyncInterval:       syncInterval,
 	})
 

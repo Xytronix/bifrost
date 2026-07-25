@@ -690,6 +690,139 @@ func TestEnrichListModelsResponse_StripsInnerOrgPrefixForFallbackPricing(t *test
 		t.Fatalf("prompt price should match llama-3.1-70b-instruct (0.0000004000), got %q", *m.Pricing.Prompt)
 	}
 }
+func TestEnrichListModelsResponse_SwapsClaudeVersionFamilyForFallbackPricing(t *testing.T) {
+	// Cursor and Warp spell Claude version-first ("claude-4.5-sonnet",
+	// "claude-4-6-opus"); the datasheet spells it family-first
+	// ("claude-sonnet-4-5"), so the two never matched and the alias stayed
+	// unpriced. Resolution rewrites the spelling — dynamic, no per-model map.
+	schemas.RegisterKnownProvider("omp-gw")
+	schemas.RegisterKnownProvider("warp")
+	t.Cleanup(func() {
+		schemas.UnregisterKnownProvider("omp-gw")
+		schemas.UnregisterKnownProvider("warp")
+	})
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"claude-sonnet-4-5": {"provider":"anthropic","mode":"chat","base_model":"claude-sonnet-4-5","max_input_tokens":200000,"input_cost_per_token":0.000003,"output_cost_per_token":0.000015},
+		"claude-opus-4-6": {"provider":"anthropic","mode":"chat","base_model":"claude-opus-4-6","max_input_tokens":200000,"input_cost_per_token":0.000005,"output_cost_per_token":0.000025}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/cursor/claude-4.5-sonnet"},
+		{ID: "warp/claude-4-6-opus-high"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+	dotted := byID["omp-gw/cursor/claude-4.5-sonnet"]
+	if dotted.Pricing == nil || dotted.Pricing.Prompt == nil {
+		t.Fatalf("version-first alias should borrow claude-sonnet-4-5 pricing, got %#v", dotted.Pricing)
+	}
+	if *dotted.Pricing.Prompt != "0.0000030000" {
+		t.Fatalf("prompt price should match claude-sonnet-4-5, got %q", *dotted.Pricing.Prompt)
+	}
+	// Effort marker and version swap must compose.
+	dashed := byID["warp/claude-4-6-opus-high"]
+	if dashed.Pricing == nil || dashed.Pricing.Prompt == nil {
+		t.Fatalf("marker+swap alias should borrow claude-opus-4-6 pricing, got %#v", dashed.Pricing)
+	}
+	if *dashed.Pricing.Prompt != "0.0000050000" {
+		t.Fatalf("prompt price should match claude-opus-4-6, got %q", *dashed.Pricing.Prompt)
+	}
+}
+
+func TestEnrichListModelsResponse_StripsResellerNamePrefixForFallbackPricing(t *testing.T) {
+	// Cursor republishes third-party models under its own name
+	// ("cursor/cursor-grok-4.5-high"); dropping the repeated provider prefix
+	// and the effort marker resolves it to the base model.
+	schemas.RegisterKnownProvider("omp-gw")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("omp-gw") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"grok-4.5": {"provider":"xai","mode":"chat","base_model":"grok-4.5","max_input_tokens":256000,"input_cost_per_token":0.000002,"output_cost_per_token":0.000006}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/cursor/cursor-grok-4.5-high"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	m := resp.Data[0]
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("reseller-prefixed alias should borrow grok-4.5 pricing, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000020000" {
+		t.Fatalf("prompt price should match grok-4.5 (0.0000020000), got %q", *m.Pricing.Prompt)
+	}
+}
+
+func TestModelResolutionCandidates_LeavesDistinctModelsAlone(t *testing.T) {
+	// The rewrites must not collapse genuinely distinct models. A name that is
+	// not version-first Claude yields no swap, and a model whose prefix merely
+	// resembles its provider keeps its own identity in the candidate list.
+	if got := swapClaudeVersionFamily("claude-sonnet-4-5"); got != "" {
+		t.Fatalf("family-first spelling must not be swapped, got %q", got)
+	}
+	if got := swapClaudeVersionFamily("claude-fable-5"); got != "" {
+		t.Fatalf("named (non-family) Claude must not be swapped, got %q", got)
+	}
+	if got := stripProviderNamePrefix("openai/gpt-4o"); got != "" {
+		t.Fatalf("model without a repeated provider prefix must not be stripped, got %q", got)
+	}
+	cands := modelResolutionCandidates("omp-gw/cursor/gpt-5.6-luna-max-fast")
+	if !slices.Contains(cands, "gpt-5.6-luna") {
+		t.Fatalf("stacked serving markers should reduce to the base model, got %v", cands)
+	}
+	if slices.Contains(cands, "gpt-5.6") {
+		t.Fatalf("distinct named variant must not collapse to gpt-5.6, got %v", cands)
+	}
+}
+func TestEnrichListModelsResponse_VendorQualifiesSubscriptionModelForPricing(t *testing.T) {
+	// A subscription reseller serves a model under its short in-house id
+	// ("kimi-code/k3") while the catalog lists the vendor-qualified name
+	// ("kimi-k3"). Those seats are billed at the normal rate elsewhere, so the
+	// qualified entry is the right price to borrow rather than leaving the
+	// model unpriced.
+	schemas.RegisterKnownProvider("omp-gw")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("omp-gw") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"kimi-k3": {"provider":"moonshot","mode":"chat","base_model":"kimi-k3","max_input_tokens":1000000,"input_cost_per_token":0.000003,"output_cost_per_token":0.000015}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/kimi-code/k3"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	m := resp.Data[0]
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("subscription alias should borrow kimi-k3 pricing, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000030000" {
+		t.Fatalf("prompt price should match kimi-k3 (0.0000030000), got %q", *m.Pricing.Prompt)
+	}
+}
+
+func TestVendorQualifiedNames(t *testing.T) {
+	got := vendorQualifiedNames("omp-gw/kimi-code/k3")
+	for _, want := range []string{"kimi-code-k3", "kimi-k3"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("expected %q among vendor-qualified forms, got %v", want, got)
+		}
+	}
+	// Already vendor-qualified: the strip direction handles it, so adding the
+	// prefix again would only produce "cursor-cursor-...".
+	if got := vendorQualifiedNames("omp-gw/cursor/cursor-grok-4.5"); slices.Contains(got, "cursor-cursor-grok-4.5") {
+		t.Fatalf("must not double-qualify an already-prefixed model, got %v", got)
+	}
+	if got := vendorQualifiedNames("gpt-4o"); len(got) != 0 {
+		t.Fatalf("unqualified id has no owning provider segment, got %v", got)
+	}
+}
 
 func TestEnrichListModelsResponse_DerivesVisionInputModalities(t *testing.T) {
 	// The datasheet advertises vision via supports_vision (no architecture

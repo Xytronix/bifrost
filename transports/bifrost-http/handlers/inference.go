@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -981,12 +982,15 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 }
 
 // trailingPricingMarkers are identity-preserving suffixes a reseller or
-// aggregator appends to a model id (effort/quant/routing) that do not change
-// the underlying model's pricing. Mirrors omp's marker vocabulary; "search" is
+// aggregator appends to a model id (effort/quant/routing/serving tier) that do
+// not change the underlying model's pricing. Mirrors omp's marker vocabulary
+// plus the tiers Cursor ("-max", "-fast"), Devin ("-slow"), Antigravity
+// ("-tiered") and Warp ("-fireworks", a serving backend) append; "search" is
 // excluded because it can denote a distinct model (e.g. sonar-pro-search).
 var trailingPricingMarkers = []string{
-	"thinking", "customtools", "high", "low", "medium", "minimal", "xhigh",
+	"thinking", "customtools", "high", "low", "medium", "minimal", "xhigh", "max",
 	"free", "cloud", "exacto", "nitro", "original", "optimized",
+	"fast", "slow", "tiered", "fireworks",
 	"nvfp4", "fp8", "fp4", "bf16", "int8", "int4",
 }
 
@@ -1016,20 +1020,102 @@ func stripTrailingModelMarkers(model string) string {
 	}
 }
 
-// fallbackEntryForModel resolves a custom/aggregator model to a base-name
-// capability+pricing entry. Tries progressively less-specific forms: as
-// reported, marker-stripped ("Opera/claude-fable-5-low" -> "claude-fable-5"),
-// and with the inner org prefix dropped ("meta/llama-3.1-70b-instruct" ->
-// "llama-3.1-70b-instruct") so NVIDIA-style provider/org/model ids resolve to
-// the aggregated base entry. Dynamic — no per-model overrides.
-func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *modelcatalog.ModelCatalog, model string) *modelcatalog.PricingEntry {
-	seen := map[string]bool{}
-	for _, cand := range []string{
+// claudeVersionFirstPattern matches the version-before-family Claude spelling
+// Cursor and Warp use ("claude-4.5-sonnet", "claude-4-6-opus"). The datasheet
+// spells these family-first ("claude-sonnet-4-5"), so the two never match
+// without a rewrite.
+var claudeVersionFirstPattern = regexp.MustCompile(
+	`^claude-([0-9](?:[0-9.\-]*[0-9])?)-(opus|sonnet|haiku)$`,
+)
+
+// swapClaudeVersionFamily rewrites "claude-4.5-sonnet" -> "claude-sonnet-4-5".
+// Returns "" when the name is not in the version-first form.
+func swapClaudeVersionFamily(model string) string {
+	m := claudeVersionFirstPattern.FindStringSubmatch(strings.ToLower(model))
+	if m == nil {
+		return ""
+	}
+	return "claude-" + m[2] + "-" + strings.ReplaceAll(m[1], ".", "-")
+}
+
+// stripProviderNamePrefix drops a leading copy of the owning provider segment
+// from the model name ("omp-gw/cursor/cursor-grok-4.5" -> "grok-4.5"), which
+// resellers add so their catalog is self-describing. Returns "" when the model
+// has no such prefix.
+func stripProviderNamePrefix(model string) string {
+	parts := strings.Split(model, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	provider, name := parts[len(parts)-2], parts[len(parts)-1]
+	prefix := provider + "-"
+	if len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+		return name[len(prefix):]
+	}
+	return ""
+}
+
+// vendorQualifiedNames prefixes the model with its owning provider segment and
+// that segment's vendor ("omp-gw/kimi-code/k3" -> "kimi-code-k3", "kimi-k3").
+// The inverse of stripProviderNamePrefix: a subscription reseller often serves
+// a model under its short in-house id while the catalog lists it under the
+// vendor-qualified one. Those subscription seats are still billed at the normal
+// rate elsewhere, so the qualified entry is the right price to borrow.
+func vendorQualifiedNames(model string) []string {
+	parts := strings.Split(model, "/")
+	if len(parts) < 2 {
+		return nil
+	}
+	provider, name := parts[len(parts)-2], parts[len(parts)-1]
+	forms := []string{provider}
+	if vendor, _, found := strings.Cut(provider, "-"); found && vendor != "" {
+		forms = append(forms, vendor)
+	}
+	out := make([]string, 0, len(forms))
+	for _, form := range forms {
+		prefix := form + "-"
+		if len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+			continue // already qualified; stripProviderNamePrefix covers that direction
+		}
+		out = append(out, prefix+name)
+	}
+	return out
+}
+
+// modelResolutionCandidates lists a model id's progressively less-specific
+// forms, most specific first: as reported, marker-stripped
+// ("Opera/claude-fable-5-low" -> "claude-fable-5"), inner org prefix dropped
+// ("meta/llama-3.1-70b-instruct" -> "llama-3.1-70b-instruct"), reseller name
+// prefix dropped, vendor-qualified ("kimi-code/k3" -> "kimi-k3"), and the
+// family-first Claude spelling. Dynamic — no per-model overrides.
+func modelResolutionCandidates(model string) []string {
+	cands := []string{
 		model,
 		stripTrailingModelMarkers(model),
 		lastPathSegment(model),
 		stripTrailingModelMarkers(lastPathSegment(model)),
-	} {
+	}
+	if bare := stripProviderNamePrefix(model); bare != "" {
+		cands = append(cands, bare, stripTrailingModelMarkers(bare))
+	}
+	for _, qualified := range vendorQualifiedNames(model) {
+		cands = append(cands, qualified, stripTrailingModelMarkers(qualified))
+	}
+	for _, cand := range append([]string(nil), cands...) {
+		if swapped := swapClaudeVersionFamily(
+			stripTrailingModelMarkers(lastPathSegment(cand)),
+		); swapped != "" {
+			cands = append(cands, swapped)
+		}
+	}
+	return cands
+}
+
+// fallbackEntryForModel resolves a custom/aggregator model to a base-name
+// capability+pricing entry by walking modelResolutionCandidates.
+func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *modelcatalog.ModelCatalog, model string) *modelcatalog.PricingEntry {
+	seen := map[string]bool{}
+	for _, cand := range modelResolutionCandidates(model) {
 		base := catalog.BaseModelName(cand)
 		if base == "" || seen[base] {
 			continue
@@ -1044,17 +1130,11 @@ func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *m
 
 // supportedParamsForModel resolves a model's OpenAI-compatible supported
 // parameters (tools, reasoning, response_format, reasoning_effort:* tiers, …)
-// from the model-parameters datasheet, trying the same progressively
-// less-specific forms as fallbackEntryForModel so aggregator/effort aliases
-// resolve to the base entry. Dynamic — no per-model overrides.
+// from the model-parameters datasheet, walking the same candidate forms as
+// fallbackEntryForModel so aggregator/effort aliases resolve to the base entry.
 func supportedParamsForModel(catalog *modelcatalog.ModelCatalog, model string) []string {
 	seen := map[string]bool{}
-	for _, cand := range []string{
-		model,
-		stripTrailingModelMarkers(model),
-		lastPathSegment(model),
-		stripTrailingModelMarkers(lastPathSegment(model)),
-	} {
+	for _, cand := range modelResolutionCandidates(model) {
 		for _, name := range []string{cand, catalog.BaseModelName(cand)} {
 			if name == "" || seen[name] {
 				continue
