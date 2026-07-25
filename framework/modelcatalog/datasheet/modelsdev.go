@@ -57,9 +57,12 @@ type modelsDevModel struct {
 	// (`["low","medium","high","xhigh","max"]`), which the upstream datasheet
 	// only ever describes as a handful of supports_*_reasoning_effort flags
 	// naming the tiers beyond low/medium/high.
+	// Values is []*string because a few upstream rows carry a null tier
+	// (sarvam: [null,"low","medium","high"]); a []string would fail the whole
+	// catalog decode and silently drop the overlay for every model.
 	ReasoningOptions []struct {
-		Type   string   `json:"type"`
-		Values []string `json:"values"`
+		Type   string    `json:"type"`
+		Values []*string `json:"values"`
 	} `json:"reasoning_options"`
 }
 
@@ -282,7 +285,17 @@ func modelsDevEffortLadder(model modelsDevModel) []string {
 		if opt.Type != "effort" || len(opt.Values) == 0 {
 			continue
 		}
-		return append([]string(nil), opt.Values...)
+		ladder := make([]string, 0, len(opt.Values))
+		for _, value := range opt.Values {
+			if value == nil || *value == "" {
+				continue
+			}
+			ladder = append(ladder, *value)
+		}
+		if len(ladder) == 0 {
+			continue
+		}
+		return ladder
 	}
 	return nil
 }

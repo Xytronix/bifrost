@@ -29,7 +29,7 @@ const modelsDevSample = `{
     "someone/no-limit-no-price": {
       "id": "someone/no-limit-no-price",
       "reasoning": true,
-      "reasoning_options": [{"type": "effort", "values": ["low","high"]}]
+      "reasoning_options": [{"type": "effort", "values": [null,"low","high"]}]
     }
   },
   "providers": {
