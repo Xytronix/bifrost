@@ -1237,10 +1237,7 @@ var (
 // catalog population.
 func (h *CompletionHandler) listModelsCached(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
 	vk, _ := ctx.Value(schemas.BifrostContextKeyVirtualKey).(string)
-	// availSet distinguishes "a valid virtual key resolved and granted these
-	// providers" (possibly none) from "no key scoping applies", which
-	// applyListModelsVirtualKeyProviderFilter signals by not setting the key.
-	avail, availSet := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
+	avail, _ := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
 
 	// Create a unique cache key based on virtual key, provider, and unfiltered status
 	providerKey := "*"
@@ -1258,7 +1255,7 @@ func (h *CompletionHandler) listModelsCached(ctx *schemas.BifrostContext, req *s
 	fresh := entry.resp != nil && time.Since(entry.at) < listAllModelsCacheTTL
 	if !fresh && entry.done == nil {
 		entry.done = make(chan struct{})
-		go h.refreshListModels(key, vk, avail, availSet, req.Provider, req.Unfiltered, entry.done)
+		go h.refreshListModels(key, vk, avail, req.Provider, req.Unfiltered, entry.done)
 	}
 	cached := entry.resp
 	done := entry.done
@@ -1302,37 +1299,12 @@ func (h *CompletionHandler) listModelsCached(ctx *schemas.BifrostContext, req *s
 
 // refreshListModels performs the (slow) provider fan-out or single-provider fetch on a detached
 // context and stores the full result in the cache under key.
-func (h *CompletionHandler) refreshListModels(key, vk string, avail []schemas.ModelProvider, availSet bool, provider schemas.ModelProvider, unfiltered bool, done chan struct{}) {
+func (h *CompletionHandler) refreshListModels(key, vk string, avail []schemas.ModelProvider, provider schemas.ModelProvider, unfiltered bool, done chan struct{}) {
 	defer close(done)
-
-	// A virtual key with no provider grants — an MCP-only key, which exists to
-	// scope tool access rather than inference — has a legitimately empty model
-	// catalog. Fanning out returns an error and leaves entry.resp nil, which
-	// surfaces to the caller as an opaque 400 "failed to list models" and sends
-	// them hunting for a client bug that is not there. Record the empty result
-	// and skip a fan-out that had nothing to ask. Checked before the client
-	// guard because it needs no client. Keyed on availSet, not on vk: the
-	// filter sets the provider list only once it has resolved a live virtual
-	// key, so an unset list means no scoping applies and the fan-out must
-	// still run.
-	if availSet && len(avail) == 0 {
-		listAllModelsCacheMu.Lock()
-		defer listAllModelsCacheMu.Unlock()
-		entry := listAllModelsCache[key]
-		if entry == nil {
-			entry = &listAllModelsCacheEntry{}
-			listAllModelsCache[key] = entry
-		}
-		entry.resp = &schemas.BifrostListModelsResponse{Data: []schemas.Model{}}
-		entry.at = time.Now()
-		entry.done = nil
-		return
-	}
 
 	if h.client == nil {
 		return
 	}
-
 	fillCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	if vk != "" {
 		fillCtx.SetValue(schemas.BifrostContextKeyVirtualKey, vk)
