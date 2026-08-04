@@ -1,9 +1,9 @@
 module github.com/maximhq/bifrost/plugins/modelcatalogresolver
 
-go 1.26.4
+go 1.26.5
 
 require (
-	github.com/maximhq/bifrost/core v1.6.3
+	github.com/maximhq/bifrost/core v1.7.5
 	github.com/maximhq/bifrost/framework v1.4.3
 )
 
