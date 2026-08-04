@@ -1,10 +1,10 @@
 module github.com/maximhq/bifrost/plugins/compat
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/bytedance/sonic v1.15.1
-	github.com/maximhq/bifrost/core v1.6.3
+	github.com/maximhq/bifrost/core v1.7.5
 	github.com/maximhq/bifrost/framework v1.4.3
 )
 
