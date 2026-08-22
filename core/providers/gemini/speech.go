@@ -88,10 +88,10 @@ func ToGeminiSpeechRequest(bifrostReq *schemas.BifrostSpeechRequest) (*GeminiGen
 	if bifrostReq == nil {
 		return nil, fmt.Errorf("bifrostReq is nil")
 	}
-	// Here we confirm if the response_format is wav or empty string
-	// If its anything else, we will return an error
-	if bifrostReq.Params != nil && bifrostReq.Params.ResponseFormat != "" && bifrostReq.Params.ResponseFormat != "wav" {
-		return nil, fmt.Errorf("gemini does not support response_format: %s. Only wav or empty string is supported which defaults to wav", bifrostReq.Params.ResponseFormat)
+	// Allowed response formats: "wav" (default when absent), or raw "pcm".
+	// Anything else is rejected — Gemini itself only produces PCM samples.
+	if bifrostReq.Params != nil && bifrostReq.Params.ResponseFormat != "" && bifrostReq.Params.ResponseFormat != "wav" && bifrostReq.Params.ResponseFormat != "pcm" {
+		return nil, fmt.Errorf("gemini does not support response_format: %s. Only wav (default), pcm, or empty string are supported", bifrostReq.Params.ResponseFormat)
 	}
 	// Create the base Gemini generation request
 	geminiReq := &GeminiGenerationRequest{
