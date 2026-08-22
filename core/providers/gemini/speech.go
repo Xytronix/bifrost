@@ -145,18 +145,19 @@ func (response *GenerateContentResponse) ToBifrostSpeechResponse(ctx context.Con
 				}
 			}
 			if len(audioData) > 0 {
-				responseFormat := ctx.Value(BifrostContextKeyResponseFormat).(string)
-				// Gemini returns PCM audio (s16le, 24000 Hz, mono)
-				// Convert to WAV for standard playable output format
-				if responseFormat == "wav" {
-					wavData, err := utils.ConvertPCMToWAV(audioData, utils.DefaultGeminiPCMConfig())
-					if err != nil {
-						return nil, fmt.Errorf("failed to convert PCM to WAV: %v", err)
-					}
-					bifrostResp.Audio = wavData
-				} else {
-					bifrostResp.Audio = audioData
-				}
+				// Absent format defaults to WAV: Gemini returns raw PCM (s16le,
+				// 24000 Hz, mono) and clients expect a playable container unless
+				// they explicitly asked for raw PCM.
+				responseFormat, _ := ctx.Value(BifrostContextKeyResponseFormat).(string)
+				if responseFormat != "pcm" {
+ 					wavData, err := utils.ConvertPCMToWAV(audioData, utils.DefaultGeminiPCMConfig())
+ 					if err != nil {
+ 						return nil, fmt.Errorf("failed to convert PCM to WAV: %v", err)
+ 					}
+ 					bifrostResp.Audio = wavData
+ 				} else {
+ 					bifrostResp.Audio = audioData
+ 				}
 			}
 
 			// Set usage information
