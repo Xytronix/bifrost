@@ -13,8 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -827,8 +829,10 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		SendError(ctx, fasthttp.StatusBadRequest, "Failed to convert context")
 		return
 	}
-	if provider == "" && !h.applyListModelsVirtualKeyProviderFilter(ctx, bifrostCtx) {
-		return
+	if provider == "" {
+		if !h.applyListModelsVirtualKeyProviderFilter(ctx, bifrostCtx) {
+			return
+		}
 	}
 
 	var resp *schemas.BifrostListModelsResponse
@@ -841,18 +845,20 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		}
 	}
 	pageToken := string(ctx.QueryArgs().Peek("page_token"))
+	unfiltered := string(ctx.QueryArgs().Peek("unfiltered")) == "true"
 
 	bifrostListModelsReq := &schemas.BifrostListModelsRequest{
-		Provider:  schemas.ModelProvider(provider),
-		PageSize:  pageSize,
-		PageToken: pageToken,
+		Provider:   schemas.ModelProvider(provider),
+		PageSize:   pageSize,
+		PageToken:  pageToken,
+		Unfiltered: unfiltered,
 	}
 
 	// Pass-through unknown query params for provider-specific features
 	extraParams := map[string]interface{}{}
 	for k, v := range ctx.QueryArgs().All() {
 		s := string(k)
-		if s != "provider" && s != "page_size" && s != "page_token" {
+		if s != "provider" && s != "page_size" && s != "page_token" && s != "unfiltered" {
 			extraParams[s] = string(v)
 		}
 	}
@@ -860,12 +866,7 @@ func (h *CompletionHandler) listModels(ctx *fasthttp.RequestCtx) {
 		bifrostListModelsReq.ExtraParams = extraParams
 	}
 
-	// If provider is empty, list all models from all providers
-	if provider == "" {
-		resp, bifrostErr = h.client.ListAllModels(bifrostCtx, bifrostListModelsReq)
-	} else {
-		resp, bifrostErr = h.client.ListModelsRequest(bifrostCtx, bifrostListModelsReq)
-	}
+	resp, bifrostErr = h.listModelsCached(bifrostCtx, bifrostListModelsReq)
 
 	if bifrostErr != nil {
 		forwardProviderHeadersFromContext(ctx, bifrostCtx)
@@ -894,6 +895,13 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 		return
 	}
 
+	// anyProviderIdx holds capability metadata keyed by canonical base model
+	// name across ALL providers, built lazily on the first model that misses
+	// the provider-scoped pricing lookup. Fallback for custom/aggregator
+	// providers (NVIDIA, Opera, custom routers) whose provider name is not in
+	// the pricing catalog but which serve well-known models.
+	var anyProviderIdx map[string]*modelcatalog.PricingEntry
+
 	for i := range resp.Data {
 		modelEntry := resp.Data[i]
 		provider, modelName := schemas.ParseModelString(modelEntry.ID, "")
@@ -903,8 +911,506 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 		}
 		// Same mapping ctx.GetModelInfo hands to plugins, so the two never drift.
 		modelcatalog.ApplyModelInfo(&modelEntry, pricingEntry)
+		// Provider-agnostic fallback: when the (model, provider) lookup found
+		// no context window (typical for custom/aggregator providers), borrow
+		// capability metadata AND base-model pricing from any catalog entry
+		// sharing the same base model name. Custom routes usually resell the
+		// canonical model at ~canonical rates, so the pricing is a best-effort
+		// estimate consumers (omp, agentsview) can surface instead of $0.
+		if modelEntry.ContextLength == nil || modelEntry.Architecture == nil {
+			if anyProviderIdx == nil {
+				anyProviderIdx = catalog.CapabilityEntriesByBaseName()
+			}
+			fallback := fallbackEntryForModel(anyProviderIdx, catalog, modelName)
+			if fallback == nil && modelEntry.Alias != nil {
+				fallback = fallbackEntryForModel(anyProviderIdx, catalog, *modelEntry.Alias)
+			}
+			if fallback != nil {
+				if modelEntry.ContextLength == nil {
+					if fallback.ContextLength != nil {
+						modelEntry.ContextLength = fallback.ContextLength
+					} else if fallback.MaxInputTokens != nil {
+						modelEntry.ContextLength = fallback.MaxInputTokens
+					}
+				}
+				if fallback.MaxInputTokens != nil && modelEntry.MaxInputTokens == nil {
+					modelEntry.MaxInputTokens = fallback.MaxInputTokens
+				}
+				if fallback.MaxOutputTokens != nil && modelEntry.MaxOutputTokens == nil {
+					modelEntry.MaxOutputTokens = fallback.MaxOutputTokens
+				}
+				if fallback.Architecture != nil && modelEntry.Architecture == nil {
+					modelEntry.Architecture = fallback.Architecture
+				}
+				if modelEntry.Pricing == nil {
+					modelEntry.Pricing = pricingFromEntry(fallback)
+				}
+			}
+		}
+		if len(modelEntry.SupportedParameters) == 0 {
+			if params := supportedParamsForModel(catalog, modelName); len(params) > 0 {
+				modelEntry.SupportedParameters = params
+			} else if modelEntry.Alias != nil {
+				if params := supportedParamsForModel(catalog, *modelEntry.Alias); len(params) > 0 {
+					modelEntry.SupportedParameters = params
+				}
+			}
+		}
+		// models.dev publishes the model's COMPLETE wire effort ladder, while
+		// the upstream datasheet only flags the tiers beyond low/medium/high.
+		// Where the vendor lookup knows a model, its ladder is authoritative.
+		efforts := reasoningEffortsForModel(catalog, modelName)
+		if len(efforts) == 0 && modelEntry.Alias != nil {
+			efforts = reasoningEffortsForModel(catalog, *modelEntry.Alias)
+		}
+		if len(efforts) > 0 {
+			modelEntry.SupportedParameters = withReasoningEffortTiers(modelEntry.SupportedParameters, efforts)
+		}
 		resp.Data[i] = modelEntry
 	}
+}
+
+// trailingPricingMarkers are identity-preserving suffixes a reseller or
+// aggregator appends to a model id (effort/quant/routing/serving tier) that do
+// not change the underlying model's pricing. Mirrors omp's marker vocabulary
+// plus the tiers Cursor ("-max", "-fast"), Devin ("-slow"), Antigravity
+// ("-tiered") and Warp ("-fireworks", a serving backend) append; "search" is
+// excluded because it can denote a distinct model (e.g. sonar-pro-search).
+var trailingPricingMarkers = []string{
+	"thinking", "customtools", "high", "low", "medium", "minimal", "xhigh", "max",
+	"free", "cloud", "exacto", "nitro", "original", "optimized",
+	"fast", "slow", "tiered", "fireworks",
+	"nvfp4", "fp8", "fp4", "bf16", "int8", "int4",
+}
+
+// stripTrailingModelMarkers peels one or more trailing identity-preserving
+// markers ("claude-fable-5-low" -> "claude-fable-5") so an aggregator alias
+// resolves to its base model. Returns the input unchanged when it has none.
+func stripTrailingModelMarkers(model string) string {
+	for {
+		trimmed := strings.TrimRight(model, " ")
+		next := trimmed
+		for _, m := range trailingPricingMarkers {
+			for _, sep := range []string{"-", ":"} {
+				suffix := sep + m
+				if len(trimmed) > len(suffix) && strings.EqualFold(trimmed[len(trimmed)-len(suffix):], suffix) {
+					next = trimmed[:len(trimmed)-len(suffix)]
+					break
+				}
+			}
+			if next != trimmed {
+				break
+			}
+		}
+		if next == trimmed {
+			return next
+		}
+		model = next
+	}
+}
+
+// claudeVersionFirstPattern matches the version-before-family Claude spelling
+// Cursor and Warp use ("claude-4.5-sonnet", "claude-4-6-opus"). The datasheet
+// spells these family-first ("claude-sonnet-4-5"), so the two never match
+// without a rewrite.
+var claudeVersionFirstPattern = regexp.MustCompile(
+	`^claude-([0-9](?:[0-9.\-]*[0-9])?)-(opus|sonnet|haiku)$`,
+)
+
+// swapClaudeVersionFamily rewrites "claude-4.5-sonnet" -> "claude-sonnet-4-5".
+// Returns "" when the name is not in the version-first form.
+func swapClaudeVersionFamily(model string) string {
+	m := claudeVersionFirstPattern.FindStringSubmatch(strings.ToLower(model))
+	if m == nil {
+		return ""
+	}
+	return "claude-" + m[2] + "-" + strings.ReplaceAll(m[1], ".", "-")
+}
+
+// stripProviderNamePrefix drops a leading copy of the owning provider segment
+// from the model name ("omp-gw/cursor/cursor-grok-4.5" -> "grok-4.5"), which
+// resellers add so their catalog is self-describing. Returns "" when the model
+// has no such prefix.
+func stripProviderNamePrefix(model string) string {
+	parts := strings.Split(model, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	provider, name := parts[len(parts)-2], parts[len(parts)-1]
+	prefix := provider + "-"
+	if len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+		return name[len(prefix):]
+	}
+	return ""
+}
+
+// vendorQualifiedNames prefixes the model with its owning provider segment and
+// that segment's vendor ("omp-gw/kimi-code/k3" -> "kimi-code-k3", "kimi-k3").
+// The inverse of stripProviderNamePrefix: a subscription reseller often serves
+// a model under its short in-house id while the catalog lists it under the
+// vendor-qualified one. Those subscription seats are still billed at the normal
+// rate elsewhere, so the qualified entry is the right price to borrow.
+func vendorQualifiedNames(model string) []string {
+	parts := strings.Split(model, "/")
+	if len(parts) < 2 {
+		return nil
+	}
+	provider, name := parts[len(parts)-2], parts[len(parts)-1]
+	forms := []string{provider}
+	if vendor, _, found := strings.Cut(provider, "-"); found && vendor != "" {
+		forms = append(forms, vendor)
+	}
+	out := make([]string, 0, len(forms))
+	for _, form := range forms {
+		prefix := form + "-"
+		if len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+			continue // already qualified; stripProviderNamePrefix covers that direction
+		}
+		out = append(out, prefix+name)
+	}
+	return out
+}
+
+// modelResolutionCandidates lists a model id's progressively less-specific
+// forms, most specific first: as reported, marker-stripped
+// ("Opera/claude-fable-5-low" -> "claude-fable-5"), inner org prefix dropped
+// ("meta/llama-3.1-70b-instruct" -> "llama-3.1-70b-instruct"), reseller name
+// prefix dropped, vendor-qualified ("kimi-code/k3" -> "kimi-k3"), and the
+// family-first Claude spelling. Dynamic — no per-model overrides.
+func modelResolutionCandidates(model string) []string {
+	cands := []string{
+		model,
+		stripTrailingModelMarkers(model),
+		lastPathSegment(model),
+		stripTrailingModelMarkers(lastPathSegment(model)),
+	}
+	if bare := stripProviderNamePrefix(model); bare != "" {
+		cands = append(cands, bare, stripTrailingModelMarkers(bare))
+	}
+	for _, qualified := range vendorQualifiedNames(model) {
+		cands = append(cands, qualified, stripTrailingModelMarkers(qualified))
+	}
+	for _, cand := range append([]string(nil), cands...) {
+		if swapped := swapClaudeVersionFamily(
+			stripTrailingModelMarkers(lastPathSegment(cand)),
+		); swapped != "" {
+			cands = append(cands, swapped)
+		}
+	}
+	return cands
+}
+
+// fallbackEntryForModel resolves a custom/aggregator model to a base-name
+// capability+pricing entry by walking modelResolutionCandidates.
+//
+// A priced entry wins outright. Catalog rows can carry capabilities without a
+// rate — models.dev knows plenty of context windows it has no price for, and a
+// seat-included model is published with no rate at all — so stopping at the
+// first hit would pin such a model to $0 and never reach the vendor-qualified
+// candidate that does carry its rate. Keep walking, and fall back to the first
+// metadata-only entry when nothing priced turns up.
+func fallbackEntryForModel(idx map[string]*modelcatalog.PricingEntry, catalog *modelcatalog.ModelCatalog, model string) *modelcatalog.PricingEntry {
+	seen := map[string]bool{}
+	var metadataOnly *modelcatalog.PricingEntry
+	for _, cand := range modelResolutionCandidates(model) {
+		base := catalog.BaseModelName(cand)
+		if base == "" || seen[base] {
+			continue
+		}
+		seen[base] = true
+		entry := idx[base]
+		if entry == nil {
+			continue
+		}
+		if entry.InputCostPerToken != nil || entry.OutputCostPerToken != nil {
+			return entry
+		}
+		if metadataOnly == nil {
+			metadataOnly = entry
+		}
+	}
+	return metadataOnly
+}
+
+// supportedParamsForModel resolves a model's OpenAI-compatible supported
+// parameters (tools, reasoning, response_format, reasoning_effort:* tiers, …)
+// from the model-parameters datasheet, walking the same candidate forms as
+// fallbackEntryForModel so aggregator/effort aliases resolve to the base entry.
+func supportedParamsForModel(catalog *modelcatalog.ModelCatalog, model string) []string {
+	seen := map[string]bool{}
+	for _, cand := range modelResolutionCandidates(model) {
+		for _, name := range []string{cand, catalog.BaseModelName(cand)} {
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			if params := catalog.GetSupportedParameters(name); len(params) > 0 {
+				return params
+			}
+		}
+	}
+	return nil
+}
+
+// reasoningEffortsForModel resolves a model's wire effort ladder from the
+// models.dev overlay, walking the same candidate forms as
+// supportedParamsForModel so aggregator and effort-suffixed aliases
+// ("omp-gw/anthropic/claude-opus-5", "claude-opus-5-high") reach the base model.
+func reasoningEffortsForModel(catalog *modelcatalog.ModelCatalog, model string) []string {
+	seen := map[string]bool{}
+	for _, cand := range modelResolutionCandidates(model) {
+		for _, name := range []string{cand, catalog.BaseModelName(cand)} {
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			if efforts := catalog.GetReasoningEfforts(name); len(efforts) > 0 {
+				return efforts
+			}
+		}
+	}
+	return nil
+}
+
+// withReasoningEffortTiers replaces any datasheet-derived reasoning_effort:*
+// tokens with the vendor ladder, keeping every other supported parameter. A
+// model that advertises an effort scale reasons by definition, so `reasoning`
+// is implied.
+func withReasoningEffortTiers(params []string, efforts []string) []string {
+	out := make([]string, 0, len(params)+len(efforts)+1)
+	hasReasoning := false
+	for _, p := range params {
+		if strings.HasPrefix(p, "reasoning_effort:") {
+			continue
+		}
+		if p == "reasoning" {
+			hasReasoning = true
+		}
+		out = append(out, p)
+	}
+	if !hasReasoning {
+		out = append(out, "reasoning")
+	}
+	for _, effort := range efforts {
+		out = append(out, "reasoning_effort:"+effort)
+	}
+	return out
+}
+
+// lastPathSegment returns the substring after the final "/", dropping an inner
+// org/namespace prefix ("meta/llama-3.1-70b-instruct" -> "llama-3.1-70b-instruct").
+func lastPathSegment(model string) string {
+	if i := strings.LastIndex(model, "/"); i >= 0 && i+1 < len(model) {
+		return model[i+1:]
+	}
+	return model
+}
+
+// pricingFromEntry builds a /v1/models Pricing block from a catalog entry's
+// cost fields, returning nil when the entry carries no cost.
+func pricingFromEntry(e *modelcatalog.PricingEntry) *schemas.Pricing {
+	if e == nil {
+		return nil
+	}
+	p := &schemas.Pricing{}
+	set := false
+	if e.InputCostPerToken != nil {
+		p.Prompt = bifrost.Ptr(fmt.Sprintf("%.10f", *e.InputCostPerToken))
+		set = true
+	}
+	if e.OutputCostPerToken != nil {
+		p.Completion = bifrost.Ptr(fmt.Sprintf("%.10f", *e.OutputCostPerToken))
+		set = true
+	}
+	if e.InputCostPerImage != nil {
+		p.Image = bifrost.Ptr(fmt.Sprintf("%.10f", *e.InputCostPerImage))
+		set = true
+	}
+	if e.CacheReadInputTokenCost != nil {
+		p.InputCacheRead = bifrost.Ptr(fmt.Sprintf("%.10f", *e.CacheReadInputTokenCost))
+		set = true
+	}
+	if e.CacheCreationInputTokenCost != nil {
+		p.InputCacheWrite = bifrost.Ptr(fmt.Sprintf("%.10f", *e.CacheCreationInputTokenCost))
+		set = true
+	}
+	if e.SearchContextCostPerQuery != nil {
+		p.WebSearch = bifrost.Ptr(fmt.Sprintf("%.10f", *e.SearchContextCostPerQuery))
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return p
+}
+
+// --- GET /v1/models catalog cache ---------------------------------------
+// A live provider fan-out (ListAllModels) on every unfiltered GET /v1/models
+// makes the endpoint take ~20s when many providers are configured, which trips
+// clients that cap model discovery at ~10s (e.g. the omp coding agent). The
+// aggregated list only changes when providers/keys change, so it is safe to
+// cache briefly and refresh in the background. Entries are keyed by the
+// request's virtual key so per-virtual-key scoping is preserved.
+const listAllModelsCacheTTL = 5 * time.Minute
+
+type listAllModelsCacheEntry struct {
+	resp *schemas.BifrostListModelsResponse
+	at   time.Time
+	done chan struct{} // non-nil while a refresh is in flight
+}
+
+var (
+	listAllModelsCacheMu sync.Mutex
+	listAllModelsCache   = map[string]*listAllModelsCacheEntry{}
+)
+
+// InvalidateListModelsCache drops the short-lived GET /v1/models response
+// cache. Provider/key reloads refresh the live catalog, but listModelsCached
+// would keep serving a still-fresh 5-minute entry until TTL expiry — so a
+// successful re-discovery would look like a no-op until the process restarts.
+// Safe to call with no active entries.
+func InvalidateListModelsCache() {
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{}
+	listAllModelsCacheMu.Unlock()
+}
+
+// listModelsCached serves GET /v1/models lists from a short
+// TTL cache. A stale entry is served immediately while a background refresh
+// runs; the first (cold) request blocks until the initial fill completes. The
+// refresh runs on a detached context so a client disconnect cannot abort
+// catalog population.
+func (h *CompletionHandler) listModelsCached(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	vk, _ := ctx.Value(schemas.BifrostContextKeyVirtualKey).(string)
+	// availSet distinguishes "a valid virtual key resolved and granted these
+	// providers" (possibly none) from "no key scoping applies", which
+	// applyListModelsVirtualKeyProviderFilter signals by not setting the key.
+	avail, availSet := ctx.Value(schemas.BifrostContextKeyAvailableProviders).([]schemas.ModelProvider)
+
+	// Create a unique cache key based on virtual key, provider, and unfiltered status
+	providerKey := "*"
+	if req.Provider != "" {
+		providerKey = string(req.Provider)
+	}
+	key := fmt.Sprintf("%s:%s:%t", vk, providerKey, req.Unfiltered)
+
+	listAllModelsCacheMu.Lock()
+	entry := listAllModelsCache[key]
+	if entry == nil {
+		entry = &listAllModelsCacheEntry{}
+		listAllModelsCache[key] = entry
+	}
+	fresh := entry.resp != nil && time.Since(entry.at) < listAllModelsCacheTTL
+	if !fresh && entry.done == nil {
+		entry.done = make(chan struct{})
+		go h.refreshListModels(key, vk, avail, availSet, req.Provider, req.Unfiltered, entry.done)
+	}
+	cached := entry.resp
+	done := entry.done
+	listAllModelsCacheMu.Unlock()
+
+	if cached == nil {
+		// Cold start: wait for the initial fill (or give up if the client left).
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, &schemas.BifrostError{
+				IsBifrostError: false,
+				Error:          &schemas.ErrorField{Message: "list models request cancelled"},
+				ExtraFields:    schemas.BifrostErrorExtraFields{RequestType: schemas.ListModelsRequest},
+			}
+		}
+		listAllModelsCacheMu.Lock()
+		cached = entry.resp
+		listAllModelsCacheMu.Unlock()
+		if cached == nil {
+			return nil, &schemas.BifrostError{
+				IsBifrostError: false,
+				Error:          &schemas.ErrorField{Message: "failed to list models"},
+				ExtraFields:    schemas.BifrostErrorExtraFields{RequestType: schemas.ListModelsRequest},
+			}
+		}
+	}
+
+	// Copy the requested page so downstream enrichment does not mutate the
+	// shared cached slice.
+	page := (&schemas.BifrostListModelsResponse{
+		Data:        cached.Data,
+		KeyStatuses: cached.KeyStatuses,
+		ExtraFields: cached.ExtraFields,
+	}).ApplyPagination(req.PageSize, req.PageToken)
+	models := make([]schemas.Model, len(page.Data))
+	copy(models, page.Data)
+	page.Data = models
+	return page, nil
+}
+
+// refreshListModels performs the (slow) provider fan-out or single-provider fetch on a detached
+// context and stores the full result in the cache under key.
+func (h *CompletionHandler) refreshListModels(key, vk string, avail []schemas.ModelProvider, availSet bool, provider schemas.ModelProvider, unfiltered bool, done chan struct{}) {
+	defer close(done)
+
+	// A virtual key with no provider grants — an MCP-only key, which exists to
+	// scope tool access rather than inference — has a legitimately empty model
+	// catalog. Fanning out returns an error and leaves entry.resp nil, which
+	// surfaces to the caller as an opaque 400 "failed to list models" and sends
+	// them hunting for a client bug that is not there. Record the empty result
+	// and skip a fan-out that had nothing to ask. Checked before the client
+	// guard because it needs no client. Keyed on availSet, not on vk: the
+	// filter sets the provider list only once it has resolved a live virtual
+	// key, so an unset list means no scoping applies and the fan-out must
+	// still run.
+	if availSet && len(avail) == 0 {
+		listAllModelsCacheMu.Lock()
+		defer listAllModelsCacheMu.Unlock()
+		entry := listAllModelsCache[key]
+		if entry == nil {
+			entry = &listAllModelsCacheEntry{}
+			listAllModelsCache[key] = entry
+		}
+		entry.resp = &schemas.BifrostListModelsResponse{Data: []schemas.Model{}}
+		entry.at = time.Now()
+		entry.done = nil
+		return
+	}
+
+	if h.client == nil {
+		return
+	}
+
+	fillCtx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	if vk != "" {
+		fillCtx.SetValue(schemas.BifrostContextKeyVirtualKey, vk)
+	}
+	if len(avail) > 0 {
+		fillCtx.SetValue(schemas.BifrostContextKeyAvailableProviders, avail)
+	}
+
+	fetchReq := &schemas.BifrostListModelsRequest{
+		Provider:   provider,
+		Unfiltered: unfiltered,
+	}
+
+	var resp *schemas.BifrostListModelsResponse
+	var err *schemas.BifrostError
+	if provider == "" {
+		resp, err = h.client.ListAllModels(fillCtx, fetchReq)
+	} else {
+		resp, err = h.client.ListModelsRequest(fillCtx, fetchReq)
+	}
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	entry := listAllModelsCache[key]
+	if entry == nil {
+		entry = &listAllModelsCacheEntry{}
+		listAllModelsCache[key] = entry
+	}
+	if err == nil && resp != nil {
+		entry.resp = resp
+		entry.at = time.Now()
+	}
+	entry.done = nil
 }
 
 // prepareTextCompletionRequest prepares a BifrostTextCompletionRequest from the HTTP request body

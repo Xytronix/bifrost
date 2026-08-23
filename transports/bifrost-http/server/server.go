@@ -893,6 +893,9 @@ func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas
 		s.Config.ModelCatalog.RetainLiveKeys(provider, keep)
 		s.RefreshLiveModelsForProvider(ctx, provider, inMemoryKeys)
 	}
+	// Drop the GET /v1/models TTL cache so the next list request re-fans-out
+	// against the (possibly just-refreshed) upstream catalogs.
+	handlers.InvalidateListModelsCache()
 	return updatedProvider, nil
 }
 
@@ -918,6 +921,7 @@ func (s *BifrostHTTPServer) RemoveProvider(ctx context.Context, provider schemas
 	}
 	s.Config.ModelCatalog.InvalidateLiveProvider(provider)
 	s.Config.ModelCatalog.RemoveKeyConfigForProvider(provider)
+	handlers.InvalidateListModelsCache()
 
 	return nil
 }
@@ -946,6 +950,7 @@ func (s *BifrostHTTPServer) OnKeyAdded(ctx context.Context, provider schemas.Mod
 		return nil
 	}
 	s.FetchAndStoreLiveForKey(ctx, provider, keyID)
+	handlers.InvalidateListModelsCache()
 	return nil
 }
 
@@ -965,13 +970,17 @@ func (s *BifrostHTTPServer) OnKeyUpdated(ctx context.Context, provider schemas.M
 	if isKeylessProvider(provider, s.Config) {
 		keyID = ""
 	}
-	s.Config.ModelCatalog.InvalidateLive(provider, keyID)
-	// Skip the fetch for a disabled key — the invalidate above still clears
-	// its stale cached entries, but re-fetching would just fail against core.
+	// Disabled keys: drop stale live entries without refetching (core would
+	// reject a scoped list-models). Enabled keys keep last-good until the
+	// refetch Upsert succeeds, so a failed re-discovery does not blank the
+	// catalog.
 	if !keyEnabled(key) {
+		s.Config.ModelCatalog.InvalidateLive(provider, keyID)
+		handlers.InvalidateListModelsCache()
 		return nil
 	}
 	s.FetchAndStoreLiveForKey(ctx, provider, keyID)
+	handlers.InvalidateListModelsCache()
 	return nil
 }
 
@@ -988,6 +997,7 @@ func (s *BifrostHTTPServer) OnKeyDeleted(ctx context.Context, provider schemas.M
 	}
 	s.Config.ModelCatalog.SetKeyConfigForProvider(provider, keys)
 	s.Config.ModelCatalog.InvalidateLive(provider, keyID)
+	handlers.InvalidateListModelsCache()
 	return nil
 }
 
@@ -1583,6 +1593,34 @@ func (s *BifrostHTTPServer) RefreshLiveModelsForAllKeys(ctx context.Context, pro
 
 	s.RefreshLiveModelsForProvider(ctx, provider, keys)
 	return nil
+}
+
+// defaultLiveModelRefreshInterval is how often every provider's list-models is
+// re-fetched into the live catalog. Without a periodic pass the catalog is only
+// ever filled at bootstrap and on key edits, so a model a provider starts
+// serving afterwards stays invisible until the gateway restarts — which is how
+// local shims (whose own upstream catalogs refresh every ~10 minutes) end up
+// looking stale. Override with BIFROST_LIVE_MODELS_REFRESH_INTERVAL (a Go
+// duration); "0" or "off" disables the refresher.
+const defaultLiveModelRefreshInterval = 15 * time.Minute
+
+// liveModelRefreshInterval resolves the configured refresh period. An
+// unparseable value falls back to the default rather than disabling the
+// refresher, so a typo cannot silently freeze the catalog; the caller logs the
+// resolved interval so the fallback is still visible.
+func liveModelRefreshInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("BIFROST_LIVE_MODELS_REFRESH_INTERVAL"))
+	switch raw {
+	case "":
+		return defaultLiveModelRefreshInterval
+	case "0", "off":
+		return 0
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed <= 0 {
+		return defaultLiveModelRefreshInterval
+	}
+	return parsed
 }
 
 // RefreshLiveModelsForProvider runs filtered + unfiltered list-models for the
