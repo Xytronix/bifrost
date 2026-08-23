@@ -91,31 +91,33 @@ func TestFilterBusinessUnitMatView_CollectsScalarAndArray(t *testing.T) {
 	assert.Equal(t, "BU One", byID["bu-arr1"], "array-only business unit must now appear")
 }
 
-// TestDimensionRankings_SingleOwnerAdditive pins the additive attribution
-// semantics for the org-rollup dimensions: each request is credited to exactly
-// one owner — the scalar team_id — and requests with no scalar owner (e.g. the
-// enterprise user/AP path that only populates the JSON array) fall into a
-// synthetic "Unassigned" bucket rather than being fanned out to every team they
-// touch. This keeps the per-team spend additive so the Teams tab reconciles to
-// the org total, and TotalActualRequests == TotalAttributedRequests.
-func TestDimensionRankings_SingleOwnerAdditive(t *testing.T) {
+// TestDimensionRankings_ArrayFanout pins the attribution semantics for the org
+// dimensions that carry a JSON-array column. The enterprise user/AP path records
+// a request's full hierarchy in team_ids and leaves the scalar team_id NULL, so
+// each id on the row must be credited in full; the scalar column still covers
+// rows written without an array. The rollup is deliberately not additive —
+// TotalAttributedRequests exceeds TotalActualRequests when a request spans
+// several teams — and only rows with neither array nor scalar owner are
+// Unassigned.
+func TestDimensionRankings_ArrayFanout(t *testing.T) {
 	store, db := setupPerfTestDB(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	// Row 1: array-only multi-team request with no scalar owner -> Unassigned.
+	// Row 1: array-only multi-team request -> credited to both teams.
 	// Row 2: single-team request with a scalar owner -> t-a.
-	// Additive: 2 requests total, each counted once.
+	// Row 3: no owner at all -> Unassigned.
 	insertTeamBULog(t, db, now, "u-1", "", "", `["t-a","t-b"]`, `["Team A","Team B"]`, "", "", "", "")
 	insertTeamBULog(t, db, now, "u-1", "t-a", "Team A", "", "", "", "", "", "")
+	insertTeamBULog(t, db, now, "u-1", "", "", "", "", "", "", "", "")
 
 	start := now.Add(-time.Hour)
 	end := now.Add(time.Hour)
 	res, err := store.GetDimensionRankings(ctx, SearchFilters{StartTime: &start, EndTime: &end}, RankingDimensionTeam)
 	require.NoError(t, err)
 
-	assert.Equal(t, int64(2), res.TotalActualRequests, "actual counts every terminal request, including Unassigned")
-	assert.Equal(t, int64(2), res.TotalAttributedRequests, "single-owner attribution is additive: attributed == actual")
+	assert.Equal(t, int64(3), res.TotalActualRequests, "actual counts every terminal request once, including Unassigned")
+	assert.Equal(t, int64(4), res.TotalAttributedRequests, "the two-team request is attributed to both teams")
 
 	requestsByID := make(map[string]int64, len(res.Rankings))
 	namesByID := make(map[string]string, len(res.Rankings))
@@ -125,12 +127,12 @@ func TestDimensionRankings_SingleOwnerAdditive(t *testing.T) {
 		namesByID[r.ID] = r.Name
 		summedRequests += r.TotalRequests
 	}
-	assert.Equal(t, int64(1), requestsByID["t-a"], "t-a owns exactly its one scalar-attributed request")
-	assert.Equal(t, int64(1), requestsByID[unassignedDimensionID], "the array-only request with no scalar owner is Unassigned")
+	assert.Equal(t, int64(2), requestsByID["t-a"], "t-a is credited its scalar row plus the array row it appears in")
+	assert.Equal(t, int64(1), requestsByID["t-b"], "an array-only team is credited rather than lost to Unassigned")
+	assert.Equal(t, "Team B", namesByID["t-b"], "name aligned with the id by ordinality")
+	assert.Equal(t, int64(1), requestsByID[unassignedDimensionID], "only the request with no owner at all is Unassigned")
 	assert.Equal(t, unassignedDimensionName, namesByID[unassignedDimensionID], "the unassigned bucket gets a stable display name")
-	_, hasTB := requestsByID["t-b"]
-	assert.False(t, hasTB, "no fan-out: t-b is never credited a request it doesn't scalar-own")
-	assert.Equal(t, res.TotalActualRequests, summedRequests, "rows must sum to the org total (additive rollup)")
+	assert.Equal(t, res.TotalAttributedRequests, summedRequests, "rows sum to attributed, not actual")
 }
 
 // TestDimensionRankings_VirtualKeyUnassigned pins that the Unassigned bucket now
@@ -209,4 +211,127 @@ func TestFilterTeamMatView_DACScopeAppliesAfterFanout(t *testing.T) {
 	assert.Equal(t, "Public Team", byID["t-public"], "team visible to the scoped user must appear")
 	_, leaked := byID["t-secret"]
 	assert.False(t, leaked, "array team owned by another user must be filtered out by DAC scope")
+}
+
+// insertOrgScopeLog inserts a log row carrying the full set of ownership
+// columns a DAC scope can predicate on, so the org dimensions
+// (customer_id / business_unit_id) can be exercised independently of the
+// user / team ones.
+func insertOrgScopeLog(t *testing.T, db *gorm.DB, ts time.Time,
+	userID, userName, teamID, customerID, buID string) {
+	t.Helper()
+	nz := func(s string) any {
+		if s == "" {
+			return nil
+		}
+		return s
+	}
+	err := db.Exec(`
+		INSERT INTO logs (id, timestamp, object_type, provider, model, status,
+			user_id, user_name, team_id, customer_id, business_unit_id,
+			created_at, latency, cost, prompt_tokens, completion_tokens, total_tokens)
+		VALUES (?, ?, 'chat_completion', 'openai', 'gpt-4', 'success',
+			?, ?, ?, ?, ?, ?, 100, 0.01, 10, 5, 15)
+	`, uuid.New().String(), ts, nz(userID), nz(userName), nz(teamID),
+		nz(customerID), nz(buID), ts).Error
+	require.NoError(t, err, "failed to insert org-scope test log")
+}
+
+// teamDataScope mirrors the predicate the enterprise DAC resolver builds for a
+// team-data principal: a single OR over every ownership dimension, including
+// the org ones. Kept faithful to that shape because the failure mode it guards
+// is a column the matview does not project, which errors the whole query rather
+// than under-filtering it.
+func teamDataScope(userIDs, teamIDs, customerIDs, buIDs []string) queryscope.QueryScope {
+	return func(db *gorm.DB) *gorm.DB {
+		return db.Where(
+			"(user_id IN ? OR team_id IN ? OR customer_id IN ? OR business_unit_id IN ?)",
+			userIDs, teamIDs, customerIDs, buIDs,
+		)
+	}
+}
+
+// TestFilterUsersMatView_TeamDataScopeIncludesOrgDimensions is the regression for
+// the org-dimension gap: mv_filter_* projected only (user_id, team_id,
+// virtual_key_id), while a team-data DAC scope also ORs customer_id and
+// business_unit_id. The matview query then failed with 42703 undefined_column,
+// which fallBackToRaw classifies as a shape error — so every team-data
+// filterdata request silently disabled the matview read path process-wide,
+// kicked a self-heal that rebuilt the same too-narrow views, and served a raw
+// full-window scan instead. The widened views must resolve the predicate AND
+// honour it: a user reachable only through the shared customer is visible, an
+// unrelated one is not.
+//
+// Asserted against getDistinctKeyPairsFromMatView rather than the public
+// GetDistinctKeyPairs precisely because the raw fallback hides the failure —
+// through the public method the old shape returns correct rows, just from the
+// wrong (slow) path.
+func TestFilterUsersMatView_TeamDataScopeIncludesOrgDimensions(t *testing.T) {
+	store, db := setupPerfTestDB(t)
+	store.matViewsReady.Store(true)
+	now := time.Now().UTC()
+
+	// Visible only via customer_id, and only via business_unit_id respectively;
+	// neither shares the principal's user or team, so the predicate cannot be
+	// satisfied without those two columns being present on the view.
+	insertOrgScopeLog(t, db, now, "u-cust", "Customer Peer", "t-other", "c-mine", "")
+	insertOrgScopeLog(t, db, now, "u-bu", "BU Peer", "t-other", "", "bu-mine")
+	insertOrgScopeLog(t, db, now, "u-outsider", "Outsider", "t-other", "c-other", "bu-other")
+	refreshTestMatViews(t, db)
+
+	ctx := queryscope.WithQueryScope(context.Background(),
+		teamDataScope([]string{"u-me"}, []string{"t-mine"}, []string{"c-mine"}, []string{"bu-mine"}))
+
+	pairs, served, err := store.getDistinctKeyPairsFromMatView(ctx, "user_id", "user_name", 1000, "")
+	require.True(t, served, "mv_filter_users must serve the users dimension")
+	require.NoError(t, err, "team-data scope must resolve against mv_filter_users' visibility columns")
+	byID := keyPairsByID(pairs)
+
+	assert.Equal(t, "Customer Peer", byID["u-cust"], "user sharing the principal's customer must appear")
+	assert.Equal(t, "BU Peer", byID["u-bu"], "user sharing the principal's business unit must appear")
+	_, leaked := byID["u-outsider"]
+	assert.False(t, leaked, "user in another customer and BU must stay hidden")
+
+	// The public path must agree, and must not have tripped the shape-error
+	// fallback on the way (that flag flip is the production symptom).
+	public, err := store.GetDistinctKeyPairs(ctx, "user_id", "user_name", 1000, "")
+	require.NoError(t, err)
+	assert.Equal(t, byID, keyPairsByID(public), "matview and public paths must agree")
+	assert.True(t, store.matViewsReady.Load(),
+		"a scoped filterdata read must not disable the matview read path")
+}
+
+// TestFilterMultiValueMatViews_TeamDataScopeResolves covers the bodyOverride
+// views (teams / business units), whose visibility columns are projected by
+// multiValueFilterMatViewBody rather than scopeProjection — the two are easy to
+// let drift apart, and drift there means the same silent demotion to raw scans.
+func TestFilterMultiValueMatViews_TeamDataScopeResolves(t *testing.T) {
+	store, db := setupPerfTestDB(t)
+	store.matViewsReady.Store(true)
+	now := time.Now().UTC()
+
+	insertOrgScopeLog(t, db, now, "u-cust", "Customer Peer", "t-visible", "c-mine", "bu-mine")
+	insertOrgScopeLog(t, db, now, "u-outsider", "Outsider", "t-hidden", "c-other", "bu-other")
+	// Name the teams/BUs so they qualify for the dropdown (the views drop rows
+	// with an empty name).
+	require.NoError(t, db.Exec(`UPDATE logs SET team_name = 'Team ' || team_id,
+		business_unit_name = 'BU ' || business_unit_id`).Error)
+	refreshTestMatViews(t, db)
+
+	ctx := queryscope.WithQueryScope(context.Background(),
+		teamDataScope([]string{"u-me"}, []string{"t-mine"}, []string{"c-mine"}, []string{"bu-mine"}))
+
+	teams, served, err := store.getDistinctKeyPairsFromMatView(ctx, "team_id", "team_name", 1000, "")
+	require.True(t, served)
+	require.NoError(t, err, "team-data scope must resolve against mv_filter_teams")
+	teamsByID := keyPairsByID(teams)
+	assert.Contains(t, teamsByID, "t-visible", "team on a row inside the principal's customer must appear")
+	assert.NotContains(t, teamsByID, "t-hidden", "team on an out-of-scope row must not leak")
+
+	bus, served, err := store.getDistinctKeyPairsFromMatView(ctx, "business_unit_id", "business_unit_name", 1000, "")
+	require.True(t, served)
+	require.NoError(t, err, "team-data scope must resolve against mv_filter_business_units")
+	busByID := keyPairsByID(bus)
+	assert.Contains(t, busByID, "bu-mine", "the principal's own business unit must appear")
+	assert.NotContains(t, busByID, "bu-other", "an out-of-scope business unit must not leak")
 }

@@ -318,15 +318,18 @@ func (h *MCPServerHandler) handleMCPServerSSE(ctx *fasthttp.RequestCtx) {
 		}
 
 		// Periodic SSE comment heartbeats keep idle connections alive through
-		// proxies and let us detect client disconnect via reader.Send() returning
-		// false — fasthttp.RequestCtx never cancels bifrostCtx on its own.
+		// proxies and let us detect client disconnect via reader.SendHeartbeat()
+		// returning false — fasthttp.RequestCtx never cancels bifrostCtx on its own.
+		//
+		// Use the shared frame, never a local one: a hand-rolled ": ping\n\n" carries the
+		// trailing blank line #5883 removed (some decoders dispatch it as an empty event,
+		// #5874) and bypasses the line-boundary gate #5905 added.
 		ticker := time.NewTicker(sseHeartbeatInterval)
 		defer ticker.Stop()
-		ping := []byte(": ping\n\n")
 		for {
 			select {
 			case <-ticker.C:
-				if !reader.Send(ping) {
+				if !reader.SendHeartbeat() {
 					return
 				}
 			case <-(*bifrostCtx).Done():
@@ -656,11 +659,9 @@ func (h *MCPServerHandler) getMCPServerForRequest(ctx *fasthttp.RequestCtx) (*mc
 	if h.identityResolver != nil &&
 		(authMode == tables.MCPServerAuthModeHeaders || authMode == tables.MCPServerAuthModeBoth) {
 		if userID, _ := ctx.UserValue(schemas.BifrostContextKeyUserID).(string); userID != "" {
-			// The user identity is the sole credential; reject a stray virtual key
-			// header so it is not also attributed to the request.
-			if headerVK := getVKFromRequest(ctx); headerVK != "" {
-				return nil, fmt.Errorf("conflicting credentials: a user token and a virtual key header were both provided; send only one")
-			}
+			// Dual-credential conflict (IDP token + VK) is handled upstream in the SCIM
+			// InferenceMiddleware before identity is stamped, respecting the operator's
+			// dual_credential_conflict_behavior config. No check needed here.
 			vkID, err := h.identityResolver.ResolveUserVirtualKey(ctx, userID)
 			if err != nil {
 				return nil, err

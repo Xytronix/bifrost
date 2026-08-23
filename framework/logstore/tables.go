@@ -1,6 +1,7 @@
 package logstore
 
 import (
+	"database/sql/driver"
 	"errors"
 	"strings"
 	"time"
@@ -52,6 +53,7 @@ type SearchFilters struct {
 	StopReasons       []string          `json:"stop_reasons,omitempty"` // For filtering by stop reason (stop, length, content_filter, refusal, tool_calls, etc.)
 	Objects           []string          `json:"objects,omitempty"`      // For filtering by request type (chat.completion, text.completion, embedding)
 	ParentRequestID   string            `json:"parent_request_id,omitempty"`
+	RootsOnly         bool              `json:"roots_only,omitempty"` // Hide rows whose parent_request_id points at another row matching these same filters, so each chain lists as its root request only. Ignored when ParentRequestID is set.
 	SelectedKeyIDs    []string          `json:"selected_key_ids,omitempty"`
 	VirtualKeyIDs     []string          `json:"virtual_key_ids,omitempty"`
 	RoutingRuleIDs    []string          `json:"routing_rule_ids,omitempty"`
@@ -74,6 +76,24 @@ type SearchFilters struct {
 	CacheHitTypes     []string          `json:"cache_hit_types,omitempty"` // For filtering by local-cache hit type ("direct", "semantic")
 	ContentSearch     string            `json:"content_search,omitempty"`
 	MetadataFilters   map[string]string `json:"metadata_filters,omitempty"` // key=metadataKey, value=metadataValue for filtering by metadata
+	// RankingLimit caps the number of rows returned by the ranking queries
+	// (GetModelRankings / GetUserRankings / GetDimensionRankings). nil means
+	// "use the store default" (defaultMaxRankingsLimit); a value <= 0 means
+	// "return every ranked entity", which is what the dashboard export uses.
+	RankingLimit *int `json:"ranking_limit,omitempty"`
+}
+
+// EffectiveRankingLimit resolves the ranking row cap: the store default when
+// the caller did not specify one, 0 when the caller explicitly asked for an
+// uncapped result.
+func (f SearchFilters) EffectiveRankingLimit(defaultLimit int) int {
+	if f.RankingLimit == nil {
+		return defaultLimit
+	}
+	if *f.RankingLimit <= 0 {
+		return 0
+	}
+	return *f.RankingLimit
 }
 
 // PaginationOptions represents pagination parameters
@@ -135,7 +155,7 @@ type UserAgentMapping struct {
 	App       string    `gorm:"type:varchar(128);not null;index" json:"app"`
 	Logo      []byte    `gorm:"type:bytea" json:"logo,omitempty"`
 	LogoMime  *string   `gorm:"type:varchar(128)" json:"logo_mime,omitempty"`
-	IsActive  bool      `gorm:"default:true;index" json:"is_active"`
+	IsActive  bool      `gorm:"index" json:"is_active"`
 	CreatedAt time.Time `gorm:"index;not null" json:"created_at"`
 	UpdatedAt time.Time `gorm:"not null" json:"updated_at"`
 }
@@ -162,6 +182,7 @@ type Log struct {
 	Alias                   *string   `gorm:"type:varchar(255);index" json:"alias,omitempty"`          // Set when model was resolved via alias mapping; the original name the caller used
 	CanonicalModelName      *string   `gorm:"type:varchar(255)" json:"canonical_model_name,omitempty"` // Canonical model name configured on the resolved alias, when set
 	AliasModelFamily        *string   `gorm:"type:varchar(255)" json:"alias_model_family,omitempty"`   // Model family configured on the resolved alias, when set
+	ServerSideFallbackModel *string   `gorm:"type:varchar(255)" json:"server_side_fallback_model,omitempty"`
 	NumberOfRetries         int       `gorm:"default:0" json:"number_of_retries"`
 	FallbackIndex           int       `gorm:"default:0" json:"fallback_index"`
 	SelectedKeyID           string    `gorm:"type:varchar(255);index:idx_logs_selected_key_id" json:"selected_key_id"`
@@ -218,6 +239,7 @@ type Log struct {
 	VideoListOutput         string    `gorm:"type:text" json:"-"`                                                      // JSON serialized *schemas.BifrostVideoListResponse
 	VideoDeleteOutput       string    `gorm:"type:text" json:"-"`                                                      // JSON serialized *schemas.BifrostVideoDeleteResponse
 	CacheDebug              string    `gorm:"type:text" json:"-"`                                                      // JSON serialized *schemas.BifrostCacheDebug
+	GuardrailDebug          string    `gorm:"type:text" json:"-"` // JSON serialized *schemas.BifrostGuardrailDebug
 	Latency                 *float64  `gorm:"index:idx_logs_latency" json:"latency,omitempty"`
 	TokenUsage              string    `gorm:"type:text" json:"-"`                                                                         // JSON serialized *schemas.LLMUsage
 	Cost                    *float64  `gorm:"index" json:"cost,omitempty"`                                                                // Cost in dollars (total cost of the request - includes cache lookup cost)
@@ -235,7 +257,15 @@ type Log struct {
 	Metadata                *string   `gorm:"type:text" json:"-"`                                                                         // JSON serialized map[string]interface{}
 	IsLargePayloadRequest   bool      `gorm:"default:false" json:"is_large_payload_request"`
 	IsLargePayloadResponse  bool      `gorm:"default:false" json:"is_large_payload_response"`
-	HasObject               bool      `gorm:"default:false" json:"-"` // True when payload is stored in object storage
+	HasObject               bool      `gorm:"default:false" json:"-"`              // True when payload is stored in object storage
+	ContentHidden           bool      `gorm:"default:false" json:"content_hidden"` // True when content logging was disabled for the request, so the payload must never be served back through the API/UI (whether it was retained in object storage or dropped entirely)
+
+	// Aggregates over this log's child rows (rows whose parent_request_id equals
+	// this log's ID, i.e. fallback attempts). Populated only on roots_only list
+	// queries so the UI can render an expandable chain row; never stored.
+	ChildCount     int64   `gorm:"-" json:"child_count,omitempty"`
+	ChildrenCost   float64 `gorm:"-" json:"children_cost,omitempty"`
+	ChildrenTokens int64   `gorm:"-" json:"children_tokens,omitempty"`
 
 	RedactionData          *schemas.RedactionData        `gorm:"-" json:"-"`                           // Transient guardrail redaction data consumed by enterprise logstore wrappers
 	RedactionMapping       string                        `gorm:"type:text" json:"-"`                   // Reversible redaction mapping (encrypted when an encryption key is set), written by enterprise logstore wrappers; deleted with the row
@@ -247,11 +277,28 @@ type Log struct {
 	BudgetIDs     *string `gorm:"type:text" json:"-"` // JSON serialized []string of budget IDs applicable to this request
 	RateLimitIDs  *string `gorm:"type:text" json:"-"` // JSON serialized []string of rate limit IDs applicable to this request
 
-	// Denormalized token fields for easier querying
+	// Denormalized token fields for easier querying. cached_read_tokens earns its
+	// place because the matviews and token histograms SUM it (see matviews.go and
+	// GetTokenHistogram). There is deliberately no cache-write counterpart: nothing
+	// aggregates cache writes, and pricing reads the cache breakdown out of
+	// token_usage rather than from a column, so it would have had no consumer.
 	PromptTokens     int `gorm:"default:0" json:"-"`
 	CompletionTokens int `gorm:"default:0" json:"-"`
 	TotalTokens      int `gorm:"index:idx_logs_total_tokens;default:0" json:"-"`
 	CachedReadTokens int `gorm:"default:0" json:"-"`
+
+	// Served billing tier, denormalized so cost recomputation can reprice a row
+	// at the rates it was actually served at. These are deliberately NOT payload
+	// fields (see payload.go): they must survive hybrid object-storage offload
+	// and content-hidden rows, both of which blank the token_usage column.
+	//
+	// token_usage cannot carry them — BifrostLLMUsage tags Speed and InferenceGeo
+	// `json:"-"`, so they never appear in any serialized usage payload. Without
+	// these columns tierFromResponse sees nothing and reprices flex traffic at
+	// standard rates.
+	ServiceTier  *string `gorm:"type:varchar(32)" json:"service_tier,omitempty"`  // OpenAI served tier: "priority" / "flex" / "default"
+	Speed        *string `gorm:"type:varchar(32)" json:"speed,omitempty"`         // Anthropic served speed: "fast" / "standard"
+	InferenceGeo *string `gorm:"type:varchar(32)" json:"inference_geo,omitempty"` // Anthropic data residency, e.g. "us"
 
 	CreatedAt time.Time `gorm:"index;not null" json:"created_at"`
 
@@ -279,6 +326,7 @@ type Log struct {
 	TranscriptionOutputParsed   *schemas.BifrostTranscriptionResponse   `gorm:"-" json:"transcription_output,omitempty"`
 	ImageGenerationOutputParsed *schemas.BifrostImageGenerationResponse `gorm:"-" json:"image_generation_output,omitempty"`
 	CacheDebugParsed            *schemas.BifrostCacheDebug              `gorm:"-" json:"cache_debug,omitempty"`
+	GuardrailDebugParsed        *schemas.BifrostGuardrailDebug          `gorm:"-" json:"guardrail_debug,omitempty"`
 	ListModelsOutputParsed      []schemas.Model                         `gorm:"-" json:"list_models_output,omitempty"`
 	MetadataParsed              map[string]interface{}                  `gorm:"-" json:"metadata,omitempty"`
 	VideoGenerationInputParsed  *schemas.VideoGenerationInput           `gorm:"-" json:"video_generation_input,omitempty"`
@@ -301,6 +349,32 @@ type Log struct {
 	VirtualKey  *tables.TableVirtualKey  `gorm:"-" json:"virtual_key,omitempty"`  // redacted
 	SelectedKey *schemas.Key             `gorm:"-" json:"selected_key,omitempty"` // redacted
 	RoutingRule *tables.TableRoutingRule `gorm:"-" json:"routing_rule,omitempty"` // redacted
+
+	// usageRebuiltFromColumns records that TokenUsageParsed came from the lossy
+	// denormalized-column rebuild in DeserializeFields rather than from a real
+	// token_usage payload. Unexported so it is invisible to GORM and to JSON: it
+	// is provenance for the current read, not row state. Read via IsUsageDegraded.
+	usageRebuiltFromColumns bool
+
+	// billingPayloadsHydrated records that this row's offloaded payload has already
+	// been fetched for billing. Needed because "absent" and "was never written" look
+	// identical in a column: a row with no cache_debug still has an empty cache_debug
+	// after a successful fetch, and without this flag the gate would fetch it again
+	// every time. Same provenance-not-state reasoning as above.
+	billingPayloadsHydrated bool
+}
+
+// IsUsageDegraded reports whether TokenUsageParsed is the lossy stub rebuilt
+// from denormalized columns instead of the real token_usage payload.
+//
+// It exists for billing. The stub carries only prompt/completion/total plus the
+// cached read/write totals, and PromptTokens is inclusive of the cache buckets —
+// so pricing a stub charges every cached token at the full input rate and can
+// inflate a cache-heavy request several fold. Callers that compute money must
+// skip these rows rather than price them; callers that render tokens (the log
+// list, the UI) are free to use the stub, which is what it was built for.
+func (l *Log) IsUsageDegraded() bool {
+	return l != nil && l.usageRebuiltFromColumns
 }
 
 // NewLogEntryFromMap creates a new Log from a map[string]interface{}
@@ -584,6 +658,14 @@ func (l *Log) SerializeFields() error {
 		}
 	}
 
+	if l.GuardrailDebugParsed != nil {
+		if data, err := sonic.Marshal(l.GuardrailDebugParsed); err != nil {
+			return err
+		} else {
+			l.GuardrailDebug = string(data)
+		}
+	}
+
 	if len(l.AttemptTrailParsed) > 0 {
 		if data, err := sonic.Marshal(l.AttemptTrailParsed); err != nil {
 			return err
@@ -755,9 +837,21 @@ func (l *Log) DeserializeFields() error {
 	}
 
 	if l.TokenUsage != "" {
+		// Reset before parsing so the result reflects only what the payload says.
+		// DeserializeFields runs twice on the hybrid hydration path, and unmarshalling
+		// over a retained stub would let a zero-valued (omitempty-elided) field in the
+		// payload inherit the stub's number instead of zero.
+		l.TokenUsageParsed = nil
 		if err := sonic.Unmarshal([]byte(l.TokenUsage), &l.TokenUsageParsed); err != nil {
 			// Log error but don't fail the operation - initialize as nil
 			l.TokenUsageParsed = nil
+		} else {
+			// A real payload supersedes any earlier column rebuild. This matters on
+			// the hybrid hydration path: AfterFind builds the stub while token_usage
+			// is still blank, then hydration fills the column and re-deserializes.
+			// Without clearing the flag the row would stay marked degraded and
+			// billing would skip a row it can now price correctly.
+			l.usageRebuiltFromColumns = false
 		}
 	}
 
@@ -885,6 +979,13 @@ func (l *Log) DeserializeFields() error {
 		}
 	}
 
+	if l.GuardrailDebug != "" {
+		if err := sonic.Unmarshal([]byte(l.GuardrailDebug), &l.GuardrailDebugParsed); err != nil {
+			// Log error but don't fail the operation - initialize as nil
+			l.GuardrailDebugParsed = nil
+		}
+	}
+
 	if l.AttemptTrail != "" {
 		if err := sonic.Unmarshal([]byte(l.AttemptTrail), &l.AttemptTrailParsed); err != nil {
 			l.AttemptTrailParsed = nil
@@ -950,9 +1051,16 @@ func (l *Log) DeserializeFields() error {
 	// Hybrid log store offloads token_usage to object storage but keeps denormalized
 	// prompt/completion/total/cached columns in the DB for analytics. Rebuild the virtual
 	// field so list APIs and the UI can render tokens without hydrating from S3 —
-	// same role content_summary plays for message previews. Only the cached-read detail
-	// is denormalized; richer details (e.g. completion_tokens_details) live solely in the
-	// offloaded payload and are restored on detail reads that hydrate from object storage.
+	// same role content_summary plays for message previews. Only the cached-read total
+	// is denormalized; the cache-write total, the 5m/1h split, and richer details such
+	// as completion_tokens_details live solely in the offloaded payload and are restored
+	// on detail reads that hydrate from object storage.
+	//
+	// This rebuild is LOSSY and must never be used for billing. PromptTokens is
+	// inclusive of the cache buckets, so a consumer that prices this stub without
+	// the details reprices every cached token at the full input rate. Billing reads
+	// go through SearchLogsForBilling, which hydrates the real payload; see
+	// IsUsageDegraded for the check that keeps the recalc job from pricing a stub.
 	if l.TokenUsage == "" && l.TokenUsageParsed == nil && (l.PromptTokens != 0 || l.CompletionTokens != 0 || l.TotalTokens != 0) {
 		usage := &schemas.BifrostLLMUsage{
 			PromptTokens:     l.PromptTokens,
@@ -965,6 +1073,7 @@ func (l *Log) DeserializeFields() error {
 			}
 		}
 		l.TokenUsageParsed = usage
+		l.usageRebuiltFromColumns = true
 	}
 
 	return nil
@@ -994,8 +1103,13 @@ type MCPToolLog struct {
 	Cost           *float64  `gorm:"index:idx_mcp_logs_cost" json:"cost,omitempty"`                               // Cost in dollars (per execution cost)
 	Status         string    `gorm:"type:varchar(50);index:idx_mcp_logs_status;not null" json:"status"`           // "processing", "success", or "error"
 	Metadata       string    `gorm:"type:text" json:"-"`                                                          // JSON serialized map[string]interface{}
+	PluginLogs     string    `gorm:"type:text" json:"plugin_logs,omitempty"`                                      // JSON serialized plugin logs grouped by plugin name
 	HasObject      bool      `gorm:"default:false" json:"-"`                                                      // True when payload is stored in object storage
 	CreatedAt      time.Time `gorm:"index;not null" json:"created_at"`
+
+	RedactionData          *schemas.RedactionData        `gorm:"-" json:"-"`                           // Transient guardrail redaction data consumed by enterprise logstore wrappers
+	RedactionMapping       string                        `gorm:"type:text" json:"-"`                   // Reversible redaction mapping written by enterprise logstore wrappers; deleted with the row
+	RevealRedactionMapping *schemas.RedactionMapsByPhase `gorm:"-" json:"redaction_mapping,omitempty"` // Virtual field populated only on permitted MCP log-detail reads
 
 	// Endpoint-agent context. These are populated for tool calls observed on a
 	// developer machine by the Bifrost Edge agent (rather than proxied by the
@@ -1234,6 +1348,12 @@ const (
 	// WebhookDeliveryOutcomeExhausted means the final allowed attempt failed.
 	WebhookDeliveryOutcomeExhausted WebhookDeliveryOutcome = "exhausted"
 )
+
+// Value implements driver.Valuer so database drivers that append typed column
+// values (e.g. clickhouse-go batch inserts) can serialize the type.
+func (o WebhookDeliveryOutcome) Value() (driver.Value, error) {
+	return string(o), nil
+}
 
 // WebhookDelivery records one webhook delivery attempt. Rows are insert-only
 // — every attempt appends a new record and existing rows are never updated —
@@ -1649,6 +1769,26 @@ var ValidHistogramDimensions = map[HistogramDimension]bool{
 	DimensionUserAgent:    true,
 }
 
+// histogramDimensionColumn maps a validated dimension to its SQL column name.
+// Query builders must use the returned literal, never string(dimension): the
+// dimension value originates from a request query parameter, and returning a
+// compile-time constant here is what keeps user input out of SQL text.
+func histogramDimensionColumn(dimension HistogramDimension) (string, bool) {
+	switch dimension {
+	case DimensionProvider:
+		return "provider", true
+	case DimensionTeam:
+		return "team_id", true
+	case DimensionCustomer:
+		return "customer_id", true
+	case DimensionUser:
+		return "user_id", true
+	case DimensionBusinessUnit:
+		return "business_unit_id", true
+	}
+	return "", false
+}
+
 // Dimension-level histogram types (generic version of Provider histograms)
 
 // DimensionCostHistogramBucket represents a single time bucket for dimension-grouped cost data
@@ -1880,11 +2020,16 @@ type DimensionRankingResult struct {
 	Rankings  []DimensionRankingWithTrend `json:"rankings"`
 	Dimension RankingDimension            `json:"dimension"`
 	// TotalActualRequests / TotalAttributedRequests are set for every rollup
-	// dimension (team / business unit / customer / user / virtual key). These use
-	// single-owner attribution (one request → one owner, with owner-less traffic
-	// in an "Unassigned" bucket), so the rollup is additive and the two counts
-	// are equal — both report the real total request count over the window,
-	// including Unassigned.
+	// dimension (team / business unit / customer / user / virtual key), and both
+	// include the "Unassigned" bucket that owner-less traffic falls into.
+	//
+	// TotalActualRequests is the real number of requests in the window.
+	// TotalAttributedRequests is the sum of every ranking row. For team /
+	// customer / business unit a request is credited to every entity it carries
+	// (the enterprise user/AP path records the full hierarchy), so attributed
+	// can exceed actual and the rankings are NOT an additive split of org
+	// traffic. User and virtual key have a single owner per request, so for them
+	// the two counts are equal.
 	TotalActualRequests     int64 `json:"total_actual_requests,omitempty"`
 	TotalAttributedRequests int64 `json:"total_attributed_requests,omitempty"`
 }

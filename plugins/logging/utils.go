@@ -802,7 +802,7 @@ func convertToProcessedStreamResponse(result *schemas.StreamAccumulatorResult, r
 		streamType = streaming.StreamTypeText
 	case schemas.ChatCompletionStreamRequest:
 		streamType = streaming.StreamTypeChat
-	case schemas.ResponsesStreamRequest, schemas.WebSocketResponsesRequest:
+	case schemas.ResponsesStreamRequest, schemas.ResponsesRetrieveStreamRequest, schemas.WebSocketResponsesRequest:
 		streamType = streaming.StreamTypeResponses
 	case schemas.SpeechStreamRequest:
 		streamType = streaming.StreamTypeAudio
@@ -829,6 +829,7 @@ func convertToProcessedStreamResponse(result *schemas.StreamAccumulatorResult, r
 		ErrorDetails:          result.ErrorDetails,
 		TokenUsage:            result.TokenUsage,
 		CacheDebug:            result.CacheDebug,
+		GuardrailDebug:        result.GuardrailDebug,
 		Cost:                  result.Cost,
 		AudioOutput:           result.AudioOutput,
 		TranscriptionOutput:   result.TranscriptionOutput,

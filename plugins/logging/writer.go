@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -386,6 +387,7 @@ func estimateLogEntrySize(log *logstore.Log) int {
 		len(log.PassthroughResponseBody) +
 		len(log.ContentSummary) +
 		len(log.CacheDebug) +
+		len(log.GuardrailDebug) +
 		len(log.RoutingEngineLogs)
 	// Baseline for fixed-width columns and struct overhead
 	return n + 512
@@ -397,7 +399,7 @@ func estimateMCPToolLogEntrySize(log *logstore.MCPToolLog) int {
 	if log == nil {
 		return 0
 	}
-	return len(log.Arguments) + len(log.Result) + len(log.ErrorDetails) + len(log.Metadata) + 512
+	return len(log.Arguments) + len(log.Result) + len(log.ErrorDetails) + len(log.Metadata) + len(log.PluginLogs) + 512
 }
 
 // buildStaleMCPToolLogEntry converts a pending MCP processing row into a
@@ -495,13 +497,15 @@ const (
 )
 
 // clampString truncates s to at most max bytes. The columns are sized in
-// characters but ASCII User-Agent headers make bytes a safe lower bound; a few
-// trailing multibyte runes are an acceptable trade for a guaranteed-valid insert.
+// characters but ASCII User-Agent headers make bytes a safe lower bound. A raw
+// byte-slice truncation can split a multi-byte UTF-8 rune, so ToValidUTF8
+// strips the dangling partial rune to keep the result valid UTF-8 for the
+// varchar insert.
 func clampString(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max]
+	return strings.ToValidUTF8(s[:max], "")
 }
 
 func applyUserAgent(entry *logstore.Log, userAgent string) {

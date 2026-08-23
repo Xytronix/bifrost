@@ -12,7 +12,27 @@ const (
 	SidekiqStatusCompleted = "completed"
 	// SidekiqStatusFailed marks a job that errored or was reaped as stale.
 	SidekiqStatusFailed = "failed"
+	// SidekiqStatusCancelled marks a job stopped on request before it finished. It is
+	// terminal and distinct from failed: nothing went wrong, the work was simply cut
+	// short, so whatever the job had already committed stands and the row is never
+	// re-claimed. The metadata still holds the partial progress counters.
+	SidekiqStatusCancelled = "cancelled"
 )
+
+// SidekiqTerminalStatuses lists the statuses a job never leaves. A job in any of
+// these is done being worked on: it is not claimable, not reapable, and not
+// counted as in-flight.
+var SidekiqTerminalStatuses = []string{SidekiqStatusCompleted, SidekiqStatusFailed, SidekiqStatusCancelled}
+
+// IsSidekiqTerminalStatus reports whether a job status is terminal.
+func IsSidekiqTerminalStatus(status string) bool {
+	switch status {
+	case SidekiqStatusCompleted, SidekiqStatusFailed, SidekiqStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
 
 // TableSidekiqJob is a generic, durable background-job record. It is intentionally
 // not tied to any feature: callers store all job-specific data (provider, filters,
@@ -26,7 +46,11 @@ type TableSidekiqJob struct {
 	// Empty in OSS (single-node) mode; set to the node ID in enterprise cluster mode.
 	// Progress/complete/fail/heartbeat writes are fenced on this value so a revived
 	// stale node cannot stomp a job another node has re-claimed.
-	RunnerID        string     `gorm:"column:runner_id;type:text;index" json:"runner_id,omitempty"`
+	RunnerID string `gorm:"column:runner_id;type:text;index" json:"runner_id,omitempty"`
+	// PartitioningKey groups jobs that must run one-at-a-time in FIFO (created_at)
+	// order across the cluster. Empty (default) = unconstrained; distinct keys
+	// still run in parallel. Enforced by ClaimPartitionedSidekiqJob.
+	PartitioningKey string     `gorm:"column:partitioning_key;type:text;index:idx_sidekiq_partitioning_key" json:"partitioning_key,omitempty"`
 	Metadata        string     `gorm:"column:metadata;type:text;default:'{}'" json:"metadata"`
 	Attempts        int        `gorm:"column:attempts;not null;default:0" json:"attempts"`
 	LastError       string     `gorm:"column:last_error;type:text" json:"last_error,omitempty"`

@@ -41,7 +41,12 @@ func newTestAsyncExecutor(t *testing.T) *AsyncJobExecutor {
 	t.Helper()
 	ctx := context.Background()
 
-	store, err := newSqliteLogStore(ctx, &SQLiteConfig{Path: ":memory:"}, asyncTestLogger{})
+	// File-backed store: some tests below poll the job row from the test
+	// goroutine while executeJob writes from another, and a :memory: DSN
+	// gives each pooled connection its own database.
+	store, err := newSqliteLogStore(ctx, &SQLiteConfig{
+		Path: filepath.Join(t.TempDir(), "asyncjob.db"),
+	}, asyncTestLogger{})
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Close(ctx) })
 
@@ -57,7 +62,7 @@ func newTestAsyncExecutor(t *testing.T) *AsyncJobExecutor {
 // waitForJobCompletion polls until the operation callback has been invoked.
 func waitForJobCompletion(t *testing.T, done *atomic.Bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if done.Load() {
 			return
@@ -73,7 +78,7 @@ func waitForJobCompletion(t *testing.T, done *atomic.Bool) {
 // Processing is intermediate and must not be treated as terminal.
 func waitForJobStatus(t *testing.T, store LogStore, jobID string) *AsyncJob {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		job, err := store.FindAsyncJobByID(context.Background(), jobID)
 		if err == nil && (job.Status == schemas.AsyncJobStatusCompleted || job.Status == schemas.AsyncJobStatusFailed) {
@@ -88,7 +93,7 @@ func waitForJobStatus(t *testing.T, store LogStore, jobID string) *AsyncJob {
 func TestSubmitJob_PropagatesContextValues(t *testing.T) {
 	executor := newTestAsyncExecutor(t)
 
-	capturedCtx := schemas.NewBifrostContext(context.Background(), <-time.After(1*time.Minute))
+	capturedCtx := schemas.NewBifrostContext(context.Background(), time.Now().Add(1*time.Minute))
 	capturedCtx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-test")
 	capturedCtx.SetValue(schemas.BifrostContextKey("x-bf-eh-custom"), "custom-value")
 	capturedCtx.SetValue(schemas.BifrostContextKey("x-bf-prom-env"), "production")
@@ -255,7 +260,7 @@ func (r *recordingWebhookDispatcher) enqueued() []AsyncJob {
 // terminal job status alone does not guarantee it already fired.
 func waitForWebhookEnqueue(t *testing.T, dispatcher *recordingWebhookDispatcher, n int) []AsyncJob {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if jobs := dispatcher.enqueued(); len(jobs) >= n {
 			return jobs
@@ -405,11 +410,17 @@ func TestExecuteJob_WebhookEnqueuedOnPanic(t *testing.T) {
 }
 
 func TestExecuteJob_NilDispatcherIsSafe(t *testing.T) {
+	// No webhook endpoint is set in context: SubmitJob fails fast when one is
+	// requested without a dispatcher wired, so this only exercises executeJob's
+	// terminal-state notifyWebhook path with a nil dispatcher.
 	executor := newWebhookTestExecutor(t, nil)
 
-	job := submitWebhookTestJob(t, executor, func(*schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	job, err := executor.SubmitJob(ctx, 3600, func(*schemas.BifrostContext) (interface{}, *schemas.BifrostError) {
 		return map[string]string{"status": "ok"}, nil
-	})
+	}, schemas.ChatCompletionRequest)
+	require.NoError(t, err)
+	require.NotNil(t, job)
 
 	stored := waitForJobStatus(t, executor.logstore, job.ID)
 	assert.Equal(t, schemas.AsyncJobStatusCompleted, stored.Status)

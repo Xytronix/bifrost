@@ -1,7 +1,8 @@
 import { useGetDimensionRankingsQuery, useLazyGetDimensionRankingsQuery } from "@/lib/store";
 import type { DimensionRankingsResponse, LogFilters, RankingDimension } from "@/lib/types/logs";
-import { forwardRef, useCallback, useImperativeHandle, useMemo } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useState } from "react";
 import type { DashboardData } from "../../utils/exportUtils";
+import { DASHBOARD_RANKINGS_LIMIT } from "../../utils/rankings";
 import { DimensionRankingsTab } from "../dimensionRankingsTab";
 
 export interface DimensionRankingsTabViewHandle {
@@ -16,38 +17,46 @@ interface DimensionRankingsTabViewProps {
 	dimensionLabel: string;
 	testIdPrefix: string;
 	dataKey: keyof DashboardData;
-	// Optional client-side reshape of the response before rendering/export. Used by
-	// the App tab to roll per-version User-Agent rows up into one row per client app.
-	transform?: (data: DimensionRankingsResponse | null) => DimensionRankingsResponse | null;
+	/** While a PDF export is rendering, show the uncapped export snapshot instead of the capped view. */
+	pdfMode?: boolean;
 }
 
 export const DimensionRankingsTabView = forwardRef<DimensionRankingsTabViewHandle, DimensionRankingsTabViewProps>(
-	function DimensionRankingsTabView({ filters, active, dimension, dimensionLabel, testIdPrefix, dataKey, transform }, ref) {
-		const fetchArg = useMemo(() => ({ filters, dimension }), [filters, dimension]);
+	function DimensionRankingsTabView({ filters, active, dimension, dimensionLabel, testIdPrefix, dataKey, pdfMode }, ref) {
+		const fetchArg = useMemo(() => ({ filters, dimension, limit: DASHBOARD_RANKINGS_LIMIT }), [filters, dimension]);
+		// Exports are never truncated: they ask for every ranked entity.
+		const exportArg = useMemo(() => ({ filters, dimension, all: true }), [filters, dimension]);
 		const skipOpts = useMemo(() => ({ skip: !active }), [active]);
 
 		const { data, isLoading: loading } = useGetDimensionRankingsQuery(fetchArg, skipOpts);
 
 		const [triggerDimensionRankings] = useLazyGetDimensionRankingsQuery();
+		const [exportData, setExportData] = useState<DimensionRankingsResponse | null>(null);
 
-		const displayData = useMemo(() => (transform ? transform(data ?? null) : (data ?? null)), [data, transform]);
+		// A snapshot belongs to the filters it was fetched with - drop it when those change.
+		useEffect(() => setExportData(null), [exportArg]);
 
 		const loadData = useCallback(async () => {
-			await triggerDimensionRankings(fetchArg, true);
-		}, [fetchArg, triggerDimensionRankings]);
+			try {
+				setExportData(await triggerDimensionRankings(exportArg, true).unwrap());
+			} catch {
+				// Fall back to the capped view rather than failing the whole export.
+				setExportData(null);
+			}
+		}, [exportArg, triggerDimensionRankings]);
 
 		useImperativeHandle(
 			ref,
 			() => ({
-				getData: () => ({ [dataKey]: displayData }),
+				getData: () => ({ [dataKey]: exportData ?? data ?? null }),
 				loadData,
 			}),
-			[displayData, dataKey, loadData],
+			[data, exportData, dataKey, loadData],
 		);
 
 		return (
 			<DimensionRankingsTab
-				data={displayData}
+				data={(pdfMode ? (exportData ?? data) : data) ?? null}
 				loading={loading}
 				dimensionLabel={dimensionLabel}
 				testIdPrefix={testIdPrefix}

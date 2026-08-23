@@ -16,18 +16,34 @@ import (
 
 const uiDevServerAddr = "localhost:3000"
 
+// ShellRewriter may rewrite the pre-hydration HTML shell before it is served.
+//
+// It is the seam the enterprise build uses to point the shell's logo at a
+// custom asset, so a branded deployment does not flash the Bifrost mark
+// for the moment before the bundle boots. OSS leaves it nil and serves the
+// embedded document exactly as bundled.
+//
+// It runs on the request path for every HTML document, so an implementation
+// must be cheap and must return data unchanged when it has nothing to do.
+type ShellRewriter func(ctx *fasthttp.RequestCtx, data []byte) []byte
+
 // UIHandler handles UI routes.
 type UIHandler struct {
 	uiContent embed.FS
 	// uiDevClient proxies dashboard requests to the local Vite dev server.
 	// It is only set when dev mode is enabled (see NewUIHandler); nil otherwise.
 	uiDevClient *fasthttp.HostClient
+	// shellRewriter rewrites the pre-hydration shell. nil disables the rewrite
+	// entirely, which is the OSS path.
+	shellRewriter ShellRewriter
 }
 
-// NewUIHandler creates a new UIHandler instance.
-func NewUIHandler(uiContent embed.FS) *UIHandler {
+// NewUIHandler creates a new UIHandler instance. shellRewriter may be nil, in
+// which case index.html is always served exactly as embedded.
+func NewUIHandler(uiContent embed.FS, shellRewriter ShellRewriter) *UIHandler {
 	h := &UIHandler{
-		uiContent: uiContent,
+		uiContent:     uiContent,
+		shellRewriter: shellRewriter,
 	}
 	// Only wire the dev-server proxy client when running in dev mode. Timeouts
 	// guard against the local Vite server hanging dashboard requests if it is
@@ -135,6 +151,13 @@ func (h *UIHandler) serveDashboard(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
+	// Give the build a chance to rewrite the static skeleton before it goes out
+	// — see ShellRewriter. nil on OSS, where the embedded bytes are served
+	// untouched.
+	if h.shellRewriter != nil && filepath.Ext(cleanPath) == ".html" {
+		data = h.shellRewriter(ctx, data)
+	}
+
 	// Set content type based on file extension
 	ext := filepath.Ext(cleanPath)
 	contentType := mime.TypeByExtension(ext)
@@ -157,8 +180,14 @@ func (h *UIHandler) serveDashboard(ctx *fasthttp.RequestCtx) {
 }
 
 // serveDevDashboard proxies dashboard requests to the local Vite dev server.
+// Restricted to loopback clients: if the dev server happens to be bound to a
+// non-loopback address, a remote client must not be able to tunnel to
+// Vite-internal endpoints (e.g. /@fs/) via this proxy.
 func (h *UIHandler) serveDevDashboard(ctx *fasthttp.RequestCtx) bool {
 	if h.uiDevClient == nil {
+		return false
+	}
+	if !ctx.RemoteIP().IsLoopback() {
 		return false
 	}
 

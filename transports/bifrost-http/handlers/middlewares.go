@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -400,6 +401,12 @@ func TransportInterceptorMiddleware(config *lib.Config) schemas.BifrostHTTPMiddl
 			}
 			// Get or create BifrostContext from fasthttp context
 			bifrostCtx := getBifrostContextFromFastHTTP(ctx)
+			// Transport pre-hooks run before the inference path stamps the
+			// catalog, so stamp it here too — otherwise ctx.GetModelInfo would
+			// be nil in HTTPTransportPreHook but populated in every other hook.
+			if config.ModelCatalog != nil {
+				bifrostCtx.SetValue(schemas.BifrostContextKeyModelCatalog, config.ModelCatalog)
+			}
 			// Acquire pooled request
 			req := schemas.AcquireHTTPRequest()
 			defer schemas.ReleaseHTTPRequest(req)
@@ -776,10 +783,11 @@ func isRealtimeTransportEndpoint(path string) bool {
 }
 
 func hasVirtualKeyCredential(ctx *fasthttp.RequestCtx) bool {
+	// x-bf-vk mirrors the canonical VK parser (lib.ConvertToBifrostContext): any
+	// non-empty value is accepted, no sk-bf- prefix required — the header itself
+	// is the signal, not the value shape.
 	if vkHeader := strings.TrimSpace(string(ctx.Request.Header.Peek(string(schemas.BifrostContextKeyVirtualKey)))); vkHeader != "" {
-		if strings.HasPrefix(strings.ToLower(vkHeader), governance.VirtualKeyPrefix) {
-			return true
-		}
+		return true
 	}
 
 	authHeader := strings.TrimSpace(string(ctx.Request.Header.Peek("Authorization")))
@@ -802,6 +810,12 @@ func hasVirtualKeyCredential(ctx *fasthttp.RequestCtx) bool {
 		}
 	}
 
+	if apiKey := strings.TrimSpace(string(ctx.Request.Header.Peek("api-key"))); apiKey != "" {
+		if strings.HasPrefix(strings.ToLower(apiKey), governance.VirtualKeyPrefix) {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -813,12 +827,24 @@ type AuthMiddleware struct {
 	wsTicketStore     *WSTicketStore
 	tempTokensService *temptoken.Service // optional; when nil, temp-token fallback is disabled
 	tempTokensEnabled atomic.Bool
+	// bootstrapToken gates creation of the very first admin account. It is sourced
+	// from operator config (config.json setup_token or the BIFROST_SETUP_TOKEN env
+	// var) — never generated in-memory — so every node in a multi-node deployment
+	// reads the identical value from its own config/env, and cleared permanently
+	// once an admin account is created. When no token is configured, it stays nil
+	// and CheckBootstrapToken fails closed: the very first admin account cannot be
+	// created until the operator sets one. This closes the unauthenticated-PUT-
+	// /api/config-plants-admin-credentials path while a fresh, not-yet-configured
+	// instance is reachable over the network.
+	bootstrapToken atomic.Pointer[string]
 }
 
 // InitAuthMiddleware initializes the auth middleware. The tempTokens service
 // is optional and still gated by client config — when nil or disabled, the
-// temp-token fallback path is skipped.
-func InitAuthMiddleware(store configstore.ConfigStore, wsTicketStore *WSTicketStore, tempTokensService *temptoken.Service) (*AuthMiddleware, error) {
+// temp-token fallback path is skipped. configuredSetupToken is the operator-
+// provisioned bootstrap token resolved from config.json/env (see
+// lib.resolveSetupToken); pass "" when the operator hasn't configured one.
+func InitAuthMiddleware(store configstore.ConfigStore, wsTicketStore *WSTicketStore, tempTokensService *temptoken.Service, configuredSetupToken string) (*AuthMiddleware, error) {
 	if store == nil {
 		return nil, fmt.Errorf("store is not present")
 	}
@@ -834,6 +860,27 @@ func InitAuthMiddleware(store configstore.ConfigStore, wsTicketStore *WSTicketSt
 	}
 
 	am.authConfig.Store(authConfig)
+
+	if authConfig == nil {
+		if configuredSetupToken != "" {
+			am.bootstrapToken.Store(&configuredSetupToken)
+			logger.Warn("================================================================")
+			logger.Warn("No admin account is configured for this Bifrost instance yet.")
+			logger.Warn("Until one is created, the dashboard/API is reachable without a")
+			logger.Warn("password from anyone who can route to this port. To finish setup,")
+			logger.Warn("pass the configured setup token as auth_config.setup_token in the")
+			logger.Warn("PUT /api/config call that creates the admin account.")
+			logger.Warn("================================================================")
+		} else {
+			logger.Warn("================================================================")
+			logger.Warn("No admin account is configured for this Bifrost instance yet, and")
+			logger.Warn("no setup token is configured. Set setup_token in config.json (or")
+			logger.Warn("the BIFROST_SETUP_TOKEN environment variable) before creating the")
+			logger.Warn("first admin account — requests to create it will be rejected until")
+			logger.Warn("a setup token is configured.")
+			logger.Warn("================================================================")
+		}
+	}
 
 	// Load whitelisted routes from client config
 	clientConfig, err := store.GetClientConfig(context.Background())
@@ -851,6 +898,28 @@ func InitAuthMiddleware(store configstore.ConfigStore, wsTicketStore *WSTicketSt
 
 func (m *AuthMiddleware) UpdateAuthConfig(authConfig *configstore.AuthConfig) {
 	m.authConfig.Store(authConfig)
+}
+
+// CheckBootstrapToken reports whether token matches the configured setup token.
+// It returns true (no token required) once an admin account already exists, so
+// this only ever gates the very first admin account. When no admin exists yet and
+// no setup token was configured at boot, it fails closed — the first admin account
+// cannot be created until the operator configures one.
+func (m *AuthMiddleware) CheckBootstrapToken(token string) bool {
+	if m.authConfig.Load() != nil {
+		return true
+	}
+	current := m.bootstrapToken.Load()
+	if current == nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(*current), []byte(token)) == 1
+}
+
+// ClearBootstrapToken permanently invalidates the setup token after the first admin
+// account has been created successfully.
+func (m *AuthMiddleware) ClearBootstrapToken() {
+	m.bootstrapToken.Store(nil)
 }
 
 // UpdateWhitelistedRoutes updates the configured whitelisted routes that bypass auth middleware.
@@ -995,6 +1064,12 @@ func (m *AuthMiddleware) middleware(shouldSkip func(*configstore.AuthConfig, str
 				// auth is fully disabled; otherwise RBAC 401s and the UI enters
 				// a logout/login redirect loop.
 				ctx.SetUserValue(schemas.IsLocalAdminContextKey, true)
+				// Distinct from IsLocalAdminContextKey (which is also true for genuinely
+				// authenticated sessions): this specifically marks "no credential was
+				// checked at all" so handlers gating especially dangerous capabilities
+				// (e.g. native plugin/subprocess loading) can require real authentication
+				// even while the rest of the API is intentionally left open.
+				ctx.SetUserValue(schemas.BifrostContextKeyAuthBypassed, true)
 				next(ctx)
 				return
 			}
@@ -1246,12 +1321,20 @@ func (m *TracingMiddleware) Middleware() schemas.BifrostHTTPMiddleware {
 			// Extract trace ID from W3C traceparent header (if present)
 			// This is the 32-char trace ID that links all spans in a distributed trace
 			inheritedTraceID := tracing.ExtractParentID(&ctx.Request.Header)
-			// Create trace in store - only ID returned (trace data stays in store)
+			// Create trace in store - the returned value is a per-request store key,
+			// not necessarily the W3C trace ID (concurrent requests may share an
+			// inherited trace ID, so the store keys them uniquely).
 			traceID := tracer.CreateTrace(inheritedTraceID, requestID)
 			// Surface correlation IDs back to the caller so a request can be pivoted
 			// into its logs (Loki) and trace (Tempo) in Grafana and similar stacks.
+			// The header must carry the W3C trace ID (that is what Tempo indexes),
+			// which equals the store key only when no traceparent was inherited.
+			headerTraceID := inheritedTraceID
+			if headerTraceID == "" {
+				headerTraceID = traceID
+			}
 			ctx.Response.Header.Set("x-request-id", requestID)
-			ctx.Response.Header.Set("x-bifrost-trace-id", traceID)
+			ctx.Response.Header.Set("x-bifrost-trace-id", headerTraceID)
 			// Store dimensions and session ID at the trace level (not as span
 			// attributes) so connectors like BigQuery can export them without
 			// changing the OTEL/Datadog span payloads.
@@ -1266,6 +1349,10 @@ func (m *TracingMiddleware) Middleware() schemas.BifrostHTTPMiddleware {
 			}
 			// Only trace ID goes into context (lightweight, no bloat)
 			ctx.SetUserValue(schemas.BifrostContextKeyTraceID, traceID)
+			// Also expose the W3C trace ID (the value in the x-bifrost-trace-id
+			// response header) so plugins that forward correlation IDs to external
+			// services advertise what Tempo indexes, not the internal store handle.
+			ctx.SetUserValue(schemas.BifrostContextKeyExportTraceID, headerTraceID)
 			// Extract parent span ID from W3C traceparent header (if present)
 			// This is the 16-char span ID from the upstream service that should be
 			// set as the ParentID of our root span for proper trace linking in Datadog/etc.

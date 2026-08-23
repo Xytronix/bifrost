@@ -107,7 +107,7 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 				content, _ := s.readToolFileContent(availableToolsPerClient, name)
 				sb.WriteString(content)
 			}
-			return createToolResponseMessage(toolCall, sb.String()), nil
+			return createToolResponseMessage(toolCall, sb.String(), false), nil
 		}
 	}
 
@@ -161,7 +161,7 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 		}
 	}
 
-	return createToolResponseMessage(toolCall, fileContent), nil
+	return createToolResponseMessage(toolCall, fileContent, false), nil
 }
 
 // readToolFileContent resolves a single VFS .pyi path to its stub text. The bool

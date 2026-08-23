@@ -85,7 +85,7 @@ func (s *StarlarkCodeMode) handleListToolFiles(ctx context.Context, toolCall sch
 	if len(availableToolsPerClient) == 0 {
 		responseText := "No servers are currently connected. There are no virtual .pyi files available. " +
 			"Please ensure servers are connected before using this tool."
-		return createToolResponseMessage(toolCall, responseText), nil
+		return createToolResponseMessage(toolCall, responseText, false), nil
 	}
 
 	// Get the code mode binding level
@@ -134,12 +134,12 @@ func (s *StarlarkCodeMode) handleListToolFiles(ctx context.Context, toolCall sch
 		if serverFilter != "" {
 			responseText = fmt.Sprintf("No connected code-mode server matches '%s'. Call listToolFiles without the server filter to see all available servers.", serverFilter)
 		}
-		return createToolResponseMessage(toolCall, responseText), nil
+		return createToolResponseMessage(toolCall, responseText, false), nil
 	}
 
 	// Build tree structure from file list
 	responseText := buildListToolFilesResponse(files, bindingLevel)
-	return createToolResponseMessage(toolCall, responseText), nil
+	return createToolResponseMessage(toolCall, responseText, false), nil
 }
 
 func buildListToolFilesResponse(files []string, bindingLevel schemas.CodeModeBindingLevel) string {

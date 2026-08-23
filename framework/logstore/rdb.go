@@ -38,7 +38,9 @@ const (
 	defaultMaxQueryLimit = 10000
 	// defaultMaxSearchLimit is the maximum number of rows returned by SearchLogs / SearchMCPToolLogs.
 	defaultMaxSearchLimit = 1000
-	// defaultMaxRankingsLimit caps the number of model+provider groups returned by GetModelRankings.
+	// defaultMaxRankingsLimit caps the number of groups returned by the ranking
+	// queries (model, user, dimension) when the caller does not ask for a
+	// different cap via SearchFilters.RankingLimit.
 	defaultMaxRankingsLimit = 100
 	// defaultFilterDataCutoffDays limits GetDistinct* filter-data queries to recent data.
 	defaultFilterDataCutoffDays = 30
@@ -46,11 +48,34 @@ const (
 
 var terminalLogStatuses = []string{"success", "error", "cancelled"}
 
+// applyRankingLimit caps a ranking query at the caller-requested number of rows,
+// falling back to defaultMaxRankingsLimit. The query is left unbounded when the
+// caller explicitly asked for every ranked entity (RankingLimit <= 0), which is
+// what the dashboard export does.
+func applyRankingLimit(q *gorm.DB, filters SearchFilters) *gorm.DB {
+	if limit := filters.EffectiveRankingLimit(defaultMaxRankingsLimit); limit > 0 {
+		return q.Limit(limit)
+	}
+	return q
+}
+
+// nonTerminalLogStatuses are the in-flight statuses structurally absent from
+// mv_logs_hourly (its DDL filters to terminalLogStatuses). Matview-backed
+// counts add these back from the raw table so totals match the row list and
+// the raw aggregate paths, which do not exclude in-flight rows.
+var nonTerminalLogStatuses = []string{"processing"}
+
 // RDBLogStore represents a log store that uses a SQLite database.
 type RDBLogStore struct {
 	db            *gorm.DB
 	logger        schemas.Logger
 	matViewsReady atomic.Bool
+	// matViewMaintenanceDisabled records that matview_refresh_interval resolved
+	// to disabled, so the self-heal path must not recreate the views either.
+	matViewMaintenanceDisabled bool
+	// Self-heal state for the matview read path (see matviewheal.go).
+	matViewHealInFlight    atomic.Bool
+	matViewHealLastAttempt atomic.Int64 // unix nanos of the last repair attempt
 }
 
 // generateBucketTimestamps generates all bucket timestamps for a time range.
@@ -107,27 +132,26 @@ func multiValueDimensionFilterSQL(scalarCol, arrayCol string, ids []string) (str
 	return sql, args
 }
 
-// teamOrBUFanoutFrom returns a Postgres FROM subquery (aliased AS logs) that fans
-// each log row out to one row per associated team / business unit, exposing
-// derived `dim_id` and `dim_name` columns alongside all original log columns
-// (l.*) so DAC scope and filters still resolve. Rows with the JSON-array column
-// set are unnested (id+name aligned by ordinality); rows without it (pre-upgrade
-// or VK-team logs) fall back to the scalar id/name — so historical logs keep
+// teamOrBUFanoutFrom is the Postgres implementation behind dimensionFanoutFrom
+// (dialectsql.go): a FROM subquery (aliased AS logs) that fans each log row out
+// to one row per associated team / business unit / customer, exposing derived
+// `dim_id` and `dim_name` columns alongside all original log columns (l.*) so
+// DAC scope and filters still resolve. Rows with the JSON-array column set are
+// unnested (id+name aligned by ordinality); rows without it (pre-upgrade or
+// VK-team logs) fall back to the scalar id/name — so historical logs keep
 // contributing. The two branches are mutually exclusive, so no row is counted
 // twice for the same dimension value. Returns ("", false) for non-fan-out
 // dimensions. idCol is the scalar id column ("team_id" / "business_unit_id"),
 // which both the ranking and histogram dimensions resolve to. No bind args: all
 // identifiers are internal constants.
+//
+// The emitted text is pinned: the filter matviews are built from it
+// (multiValueFilterMatViewBody), and repairMatViewShapes treats a changed body
+// as drift and drops the views on boot. Change it only when a rebuild is
+// intended.
 func teamOrBUFanoutFrom(idCol string) (string, bool) {
-	var arrIDs, arrNames, scalarName string
-	switch idCol {
-	case "team_id":
-		arrIDs, arrNames, scalarName = "team_ids", "team_names", "team_name"
-	case "business_unit_id":
-		arrIDs, arrNames, scalarName = "business_unit_ids", "business_unit_names", "business_unit_name"
-	case "customer_id":
-		arrIDs, arrNames, scalarName = "customer_ids", "customer_names", "customer_name"
-	default:
+	arrIDs, arrNames, scalarName, ok := fanoutDimensionColumns(idCol)
+	if !ok {
 		return "", false
 	}
 	return fmt.Sprintf(`(
@@ -146,27 +170,30 @@ func teamOrBUFanoutFrom(idCol string) (string, bool) {
 }
 
 // Rollup dimensions (team / business unit / customer / user / virtual key)
-// attribute each request to exactly ONE owner — the scalar id column — so that
-// per-dimension spend sums to the org total (an additive finance rollup).
-// Requests with no owner are grouped under a synthetic "Unassigned" entry
-// rather than dropped, so the rollup still reconciles to total spend.
+// group owner-less traffic under a synthetic "Unassigned" entry rather than
+// dropping it, so the rollup still reconciles to total spend.
 //
-// This deliberately replaces the multi-value fan-out (teamOrBUFanoutFrom) for
-// the *aggregate* readers (rankings + cost/token histograms): fan-out credited a
-// request to every team it touched, which double-counted shared requests and
-// made the tab non-additive (a user in N overlapping IdP groups inflated every
-// group to the same total). Fan-out is still used for filter dropdowns, where
-// listing every team a request touches is the correct behaviour.
+// How a request is attributed depends on whether the dimension has a
+// multi-value column. Team / business unit / customer do: the enterprise
+// user/AP path is the only writer that knows a request's full hierarchy, and it
+// records it in the JSON-array columns (team_ids, customer_ids, ...) while
+// leaving the scalar column NULL. The aggregate readers therefore fan those
+// rows out to every id they carry (dimensionFanoutFrom), falling back to the
+// scalar column for rows that have no array — otherwise all enterprise traffic
+// collapses into "Unassigned". A request touching N teams is credited in full
+// to each, so the per-dimension breakdown is NOT additive: it answers "what did
+// this team consume", not "how does org spend divide". DimensionRankingResult
+// reports TotalActualRequests alongside TotalAttributedRequests so the UI can
+// show both. User and virtual key have no array column and stay single-owner.
 const (
 	unassignedDimensionID   = "unassigned"
 	unassignedDimensionName = "Unassigned"
 )
 
 // isBucketedDimension reports whether a scalar id column is a rollup dimension
-// that uses single-owner attribution with an Unassigned bucket: each request is
-// credited to exactly one owner (the scalar id), and rows with no owner collapse
-// into a synthetic "Unassigned" entry so the per-dimension rollup stays additive
-// and reconciles to the org total. idCol is an internal constant.
+// that uses the Unassigned bucket: rows with no owner collapse into a synthetic
+// "Unassigned" entry instead of being dropped, so the rollup reconciles to
+// total spend. idCol is an internal constant.
 func isBucketedDimension(idCol string) bool {
 	switch idCol {
 	case "team_id", "business_unit_id", "customer_id", "user_id", "virtual_key_id":
@@ -181,6 +208,71 @@ func isBucketedDimension(idCol string) bool {
 // internal constant, so the interpolation carries no user input.
 func bucketedIDExpr(idCol string) string {
 	return fmt.Sprintf("COALESCE(NULLIF(%s, ''), '%s')", idCol, unassignedDimensionID)
+}
+
+// dimensionReadSource describes how the aggregate dimension readers (rankings +
+// the cost / token / latency histograms) must read the logs table for one
+// dimension: which relation to select from, which expression yields the
+// dimension id, and which column holds its display name.
+type dimensionReadSource struct {
+	// FromSQL is the fan-out subquery to read from, or "" to read the logs
+	// table directly.
+	FromSQL string
+	// IDExpr is the expression to group and order on.
+	IDExpr string
+	// NameCol holds the display name, or "" when the dimension has none.
+	NameCol string
+	// Bucketed reports that owner-less rows collapse into unassignedDimensionID.
+	Bucketed bool
+	// FannedOut reports that FromSQL emits one row per (request, dimension
+	// value) pair, so attributed requests may exceed actual requests.
+	FannedOut bool
+}
+
+// dimensionReadSourceFor resolves how to read a dimension. Team / customer /
+// business unit fan out to every id in their JSON-array column when the dialect
+// supports it, falling back to the scalar column for rows without an array;
+// user / virtual key have no array column and keep single-owner scalar
+// attribution with an Unassigned bucket; every other dimension (provider, app,
+// user agent) reads its scalar column with no bucket. idCol / nameCol come from
+// DimensionColumnDef or histogramDimensionColumn and are internal constants.
+func (s *RDBLogStore) dimensionReadSourceFor(idCol, nameCol string) dimensionReadSource {
+	src := dimensionReadSource{NameCol: nameCol, Bucketed: isBucketedDimension(idCol)}
+	if !src.Bucketed {
+		src.IDExpr = idCol
+		return src
+	}
+	if from, ok := dimensionFanoutFrom(s.db.Dialector.Name(), idCol); ok {
+		src.FromSQL = from
+		src.FannedOut = true
+		src.IDExpr = bucketedIDExpr("dim_id")
+		if nameCol != "" {
+			src.NameCol = "dim_name"
+		}
+		return src
+	}
+	src.IDExpr = bucketedIDExpr(idCol)
+	return src
+}
+
+// base starts a query against the resolved relation. db must already be
+// ScopedDB(ctx) when row visibility matters — the fan-out subquery re-exposes
+// every log column via l.*, so scope and filter predicates resolve against the
+// source row exactly as they do on the base table.
+//
+// The subquery already carries its own `AS logs` alias (the filter matviews are
+// built from that same text), so it is passed as a bind expression rather than
+// wrapped again: inlining it into Table() would also make GORM's leftmost-match
+// table regexp latch onto the "AS dim_id" inside the SQL. The statement table is
+// set explicitly because that regexp cannot see through the bind — it must stay
+// "logs", which is the alias applyRootsOnlyFilter correlates against.
+func (src dimensionReadSource) base(db *gorm.DB) *gorm.DB {
+	if src.FromSQL == "" {
+		return db.Model(&Log{})
+	}
+	tx := db.Table("?", gorm.Expr(src.FromSQL))
+	tx.Statement.Table = "logs"
+	return tx
 }
 
 // applyFilters applies search filters to a GORM query. Callers are
@@ -211,7 +303,12 @@ func (s *RDBLogStore) applyFilters(baseQuery *gorm.DB, filters SearchFilters) *g
 		baseQuery = baseQuery.Where("object_type IN ?", filters.Objects)
 	}
 	if filters.ParentRequestID != "" {
-		baseQuery = baseQuery.Where("parent_request_id = ?", filters.ParentRequestID)
+		// A row is never its own child: parent_request_id is client-settable, and
+		// a self-referencing row already lists as a root (see applyRootsOnlyFilter),
+		// so without this it would also appear inside its own expansion.
+		baseQuery = baseQuery.Where("parent_request_id = ? AND id <> parent_request_id", filters.ParentRequestID)
+	} else if filters.RootsOnly {
+		baseQuery = s.applyRootsOnlyFilter(baseQuery, filters)
 	}
 	if len(filters.SelectedKeyIDs) > 0 {
 		baseQuery = baseQuery.Where("selected_key_id IN ?", filters.SelectedKeyIDs)
@@ -342,7 +439,7 @@ func (s *RDBLogStore) applyFilters(baseQuery *gorm.DB, filters SearchFilters) *g
 			case "postgres":
 				// Match the same loose-JSON guard used by aggregateCacheHits so the regex extract is safe.
 				baseQuery = baseQuery.Where(
-					"cache_debug IS NOT NULL AND cache_debug <> '' AND cache_debug ~ '^\\s*\\{.*\\}\\s*$' AND substring(cache_debug from '\"hit_type\"[[:space:]]*:[[:space:]]*\"([^\"]+)\"') IN ?",
+					cacheDebugJSONGuard+" AND "+cacheDebugHitTypeExpr+" IN ?",
 					valid,
 				)
 			case "clickhouse":
@@ -411,6 +508,51 @@ func (s *RDBLogStore) applyFilters(baseQuery *gorm.DB, filters SearchFilters) *g
 		}
 	}
 	return baseQuery
+}
+
+// applyRootsOnlyFilter hides rows that nest under another row already present in
+// this same result set, so each fallback chain lists as its root request.
+//
+// The parent set is the *filtered, scoped* population, not the whole table: a
+// row is only hidden when the row it points at would itself be listed. This is
+// what keeps a chain from vanishing when a filter matches only part of it —
+// with `status=success` over a chain whose root errored and whose retry
+// succeeded, the root fails the filter, so the retry is not hidden and lists as
+// its own root instead of disappearing. It also means the subquery inherits the
+// caller's QueryScope and time window: a child whose parent is invisible to
+// this caller, or falls outside the range, is promoted rather than dropped.
+//
+// Rows whose parent_request_id is a client/provider session string (baggage,
+// realtime `sess_…`) match no log id and stay top-level, as do self-referencing
+// rows — parent_request_id is client-settable, and a row that points at itself
+// would otherwise be unreachable from any view.
+func (s *RDBLogStore) applyRootsOnlyFilter(baseQuery *gorm.DB, filters SearchFilters) *gorm.DB {
+	ctx := baseQuery.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Same filters, minus the two that describe *this* query's shape rather than
+	// which rows are listable. Clearing RootsOnly also stops the recursion.
+	parentFilters := filters
+	parentFilters.RootsOnly = false
+	parentFilters.ParentRequestID = ""
+
+	if s.db.Dialector.Name() == "clickhouse" {
+		// ClickHouse has no correlated subqueries, so the parent id set is built
+		// once per query. The inherited filters (crucially the time window) bound
+		// it — an unfiltered `SELECT id FROM logs` would materialize every id in
+		// the table on every page load.
+		parents := s.applyFilters(s.ScopedDB(ctx).Model(&Log{}).Select("id"), parentFilters)
+		return baseQuery.Where("(parent_request_id IS NULL OR parent_request_id = id OR parent_request_id NOT IN (?))", parents)
+	}
+
+	// Correlated form elsewhere: the PK lookup on parent.id keeps this an index
+	// probe per candidate row rather than a materialized anti-join. Unqualified
+	// columns in the filter predicates bind to the inner `parent` scope.
+	parents := s.applyFilters(s.ScopedDB(ctx).Table("logs AS parent").Select("1"), parentFilters).
+		Where("parent.id = logs.parent_request_id")
+	return baseQuery.Where("(parent_request_id IS NULL OR parent_request_id = id OR NOT EXISTS (?))", parents)
 }
 
 // Create inserts a new log entry into the database.
@@ -684,6 +826,88 @@ func (s *RDBLogStore) bulkUpdateCostPostgres(ctx context.Context, updates map[st
 
 // SearchLogs searches for logs in the database without calculating statistics.
 func (s *RDBLogStore) SearchLogs(ctx context.Context, filters SearchFilters, pagination PaginationOptions) (*SearchResult, error) {
+	return s.searchLogs(ctx, filters, pagination, s.listSelectColumns())
+}
+
+// SearchLogsForBilling searches with the billing projection.
+func (s *RDBLogStore) SearchLogsForBilling(ctx context.Context, filters SearchFilters, pagination PaginationOptions) (*SearchResult, error) {
+	result, err := s.searchLogs(ctx, filters, pagination, s.billingSelectColumns())
+	if err != nil || result == nil {
+		return result, err
+	}
+	for i := range result.Logs {
+		stripNonBillingPayloadBytes(&result.Logs[i])
+	}
+	return result, nil
+}
+
+// HydrateBillingChunk is a no-op for a pure RDB store: nothing is offloaded, so every
+// pricing input is already in the row. The hybrid store overrides this to fetch.
+func (s *RDBLogStore) HydrateBillingChunk(_ context.Context, _ []*Log) (BillingHydrationResult, error) {
+	return BillingHydrationResult{}, nil
+}
+
+// BulkBackfillBillingPayloads writes recovered token_usage / cache_debug back into their
+// rows so later recomputes need no object fetch.
+//
+// Only ever called with rows whose payload was actually fetched, which in a pure RDB
+// store is never — this exists for the hybrid store layered on top, which delegates here.
+func (s *RDBLogStore) BulkBackfillBillingPayloads(ctx context.Context, updates map[string]BillingPayloadBackfill) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	// ClickHouse has no row UPDATE; mutations are async and expensive, which is why
+	// BulkUpdateCost re-inserts the whole row there instead. Re-inserting just to
+	// populate a cache of something object storage already holds is not worth that
+	// cost, so ClickHouse deployments keep fetching. Skipped rather than errored
+	// because the backfill is an optimisation, not part of the job's output.
+	if s.db.Dialector.Name() == "clickhouse" {
+		return nil
+	}
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for id, backfill := range updates {
+			// Both written unconditionally, including an empty cache_debug: the gate
+			// infers "already backfilled" from token_usage being present on an
+			// offloaded row, so an empty cache_debug beside it correctly reads as
+			// "the object held none" rather than "not yet recovered".
+			columns := map[string]any{
+				"token_usage": backfill.TokenUsage,
+				"cache_debug": backfill.CacheDebug,
+			}
+			if err := tx.Model(&Log{}).Where("id = ?", id).Updates(columns).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// stripNonBillingPayloadBytes releases bytes that a modality payload carries but
+// pricing never reads.
+//
+// Today that is generated image data. computeImageCost needs the image *count* plus
+// size and quality — extractCostInput passes len(Data) to populateOutputImageCount and
+// never touches the images themselves — while ImageData.B64JSON holds full base64
+// bytes, megabytes per image. A recompute holds a whole batch at once, so keeping them
+// is a straight path to an OOM on an image-generation window.
+//
+// The serialized column is cleared too: it has already been parsed, and the row is
+// never re-deserialized or written back.
+func stripNonBillingPayloadBytes(l *Log) {
+	if l == nil || l.ImageGenerationOutputParsed == nil {
+		return
+	}
+	for i := range l.ImageGenerationOutputParsed.Data {
+		l.ImageGenerationOutputParsed.Data[i].B64JSON = ""
+		l.ImageGenerationOutputParsed.Data[i].URL = ""
+		l.ImageGenerationOutputParsed.Data[i].RevisedPrompt = ""
+	}
+	l.ImageGenerationOutput = ""
+}
+
+func (s *RDBLogStore) searchLogs(ctx context.Context, filters SearchFilters, pagination PaginationOptions, selectColumns string) (*SearchResult, error) {
 	// Build order clause up front (needed by the data goroutine).
 	direction := "DESC"
 	if pagination.Order == "asc" {
@@ -725,9 +949,11 @@ func (s *RDBLogStore) SearchLogs(ctx context.Context, filters SearchFilters, pag
 		// keep the matview win because raw COUNT over multi-day ranges is the
 		// expensive path.
 		if s.db.Dialector.Name() == "postgres" && s.canUseMatViewForFreshAggregate(filters) {
-			var err error
-			totalCount, err = s.getCountFromMatView(gCtx, filters)
-			return err
+			c, err := s.getCountFromMatView(gCtx, filters)
+			if !s.fallBackToRaw(err) {
+				totalCount = c
+				return err
+			}
 		}
 		countQuery := s.ScopedDB(gCtx).Model(&Log{})
 		countQuery = s.applyFilters(countQuery, filters)
@@ -737,7 +963,7 @@ func (s *RDBLogStore) SearchLogs(ctx context.Context, filters SearchFilters, pag
 	g.Go(func() error {
 		dataQuery := s.ScopedDB(gCtx).Model(&Log{})
 		dataQuery = s.applyFilters(dataQuery, filters)
-		dataQuery = dataQuery.Order(orderClause).Select(s.listSelectColumns()).Limit(limit)
+		dataQuery = dataQuery.Order(orderClause).Select(selectColumns).Limit(limit)
 		if pagination.Offset > 0 {
 			dataQuery = dataQuery.Offset(pagination.Offset)
 		}
@@ -750,6 +976,12 @@ func (s *RDBLogStore) SearchLogs(ctx context.Context, filters SearchFilters, pag
 
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	if filters.RootsOnly {
+		if err := s.attachChildAggregates(ctx, logs, filters); err != nil {
+			return nil, err
+		}
 	}
 
 	hasLogs := len(logs) > 0
@@ -770,6 +1002,65 @@ func (s *RDBLogStore) SearchLogs(ctx context.Context, filters SearchFilters, pag
 		},
 		HasLogs: hasLogs,
 	}, nil
+}
+
+// attachChildAggregates populates ChildCount/ChildrenCost/ChildrenTokens on the
+// given page of logs with one grouped query over the page's IDs. The index on
+// parent_request_id keeps this cheap (bounded by the page size), and the
+// rolled-up cost/tokens let the UI summarize a collapsed fallback chain.
+//
+// The same filters that produced the page are applied to the children, so a
+// collapsed chain summarizes exactly the rows that expanding it lists (the
+// expand call re-queries with these filters plus parent_request_id). A root
+// whose children all fail the filters reports ChildCount 0 and offers nothing
+// to expand.
+func (s *RDBLogStore) attachChildAggregates(ctx context.Context, logs []Log, filters SearchFilters) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(logs))
+	for _, log := range logs {
+		ids = append(ids, log.ID)
+	}
+
+	var aggs []struct {
+		ParentRequestID string  `gorm:"column:parent_request_id"`
+		ChildCount      int64   `gorm:"column:child_count"`
+		ChildrenCost    float64 `gorm:"column:children_cost"`
+		ChildrenTokens  int64   `gorm:"column:children_tokens"`
+	}
+	// Clear the two filters that describe the shape of the roots query rather
+	// than which rows are listable; the rest carry over verbatim. Clearing
+	// RootsOnly also keeps the parent-existence subquery out of this query — a
+	// child is counted against its own parent, not re-tested for one.
+	childFilters := filters
+	childFilters.RootsOnly = false
+	childFilters.ParentRequestID = ""
+
+	err := s.applyFilters(s.ScopedDB(ctx).Model(&Log{}), childFilters).
+		Select("parent_request_id, COUNT(*) AS child_count, COALESCE(SUM(cost), 0) AS children_cost, COALESCE(SUM(total_tokens), 0) AS children_tokens").
+		Where("parent_request_id IN ? AND id <> parent_request_id", ids).
+		Group("parent_request_id").
+		Scan(&aggs).Error
+	if err != nil {
+		return fmt.Errorf("failed to aggregate child logs: %w", err)
+	}
+	if len(aggs) == 0 {
+		return nil
+	}
+
+	byParent := make(map[string]int, len(aggs))
+	for i, agg := range aggs {
+		byParent[agg.ParentRequestID] = i
+	}
+	for i := range logs {
+		if aggIdx, ok := byParent[logs[i].ID]; ok {
+			logs[i].ChildCount = aggs[aggIdx].ChildCount
+			logs[i].ChildrenCost = aggs[aggIdx].ChildrenCost
+			logs[i].ChildrenTokens = aggs[aggIdx].ChildrenTokens
+		}
+	}
+	return nil
 }
 
 // GetSessionLogs returns paginated logs for a single parent_request_id session.
@@ -935,7 +1226,7 @@ func normalizeAggregateTimestamp(value any) string {
 func (s *RDBLogStore) listSelectColumns() string {
 	baseCols := strings.Join([]string{
 		"id", "parent_request_id", "timestamp", "object_type", "provider", "model", "alias",
-		"canonical_model_name", "alias_model_family",
+		"canonical_model_name", "alias_model_family", "server_side_fallback_model",
 		"number_of_retries", "fallback_index",
 		"selected_key_id", "selected_key_name",
 		"virtual_key_id", "virtual_key_name",
@@ -954,6 +1245,9 @@ func (s *RDBLogStore) listSelectColumns() string {
 		"metadata", "cache_debug",
 		"is_large_payload_request", "is_large_payload_response",
 		"prompt_tokens", "completion_tokens", "total_tokens",
+		"cached_read_tokens",
+		"has_object", "content_hidden",
+		"service_tier", "speed", "inference_geo",
 		"created_at",
 	}, ", ")
 
@@ -1005,6 +1299,99 @@ func (s *RDBLogStore) listSelectColumns() string {
 	return baseCols + ", " + inputHistoryExpr + ", " + responsesInputExpr + ", " + outputMessageExpr
 }
 
+// billingPayloadColumns are the payload columns cost recomputation reads to recover a
+// billing dimension that BifrostLLMUsage cannot express: audio duration and the
+// audio/text token split, TTS input character counts, output image counts with size
+// and quality, video duration, and OCR pages processed. Without them those request
+// types are priced off aggregate token counts alone, which is wrong for every one.
+//
+// Each is keyed to the object_type values that actually bill on it, so a chat row
+// never drags an unrelated payload into memory — see billingSelectColumns.
+var billingPayloadColumns = map[string][]string{
+	"speech_output":        {"speech", "speech_stream"},
+	"transcription_output": {"transcription", "transcription_stream"},
+	"image_generation_output": {
+		"image_generation", "image_generation_stream",
+		"image_edit", "image_edit_stream",
+		"image_variation",
+	},
+	"video_generation_output": {"video_generation", "video_remix"},
+	"ocr_output":              {"ocr"},
+}
+
+// billingScalarColumns is every non-payload column cost recomputation reads, and
+// nothing else. Traced from calculateCostForLog, pricingScopesForLog,
+// servedTierFromLog, isKnownZeroCostLog, and the recalc job's cursor bookkeeping.
+//
+// Deliberately NOT built on listSelectColumns: that projection serves /api/logs and
+// carries message previews, content summaries, metadata and every denormalized
+// governance name — none of which pricing looks at. A recompute holds a whole batch in
+// memory at once, so every column it does not need is pure ballast.
+var billingScalarColumns = []string{
+	// Identity and the object-storage key.
+	"id", "timestamp", "object_type",
+	// Pricing lookup: provider, the wire/alias/canonical model triplet, and the
+	// server-side fallback model that resolvePricing ranks first.
+	"provider", "model", "alias", "canonical_model_name", "server_side_fallback_model",
+	// Override scopes.
+	"selected_key_id", "virtual_key_id", "user_id",
+	// Usage, and the denormalized fallback used when token_usage was offloaded.
+	"token_usage", "prompt_tokens", "completion_tokens", "total_tokens", "cached_read_tokens",
+	// Semantic-cache billing.
+	"cache_debug",
+	// Whether the payload was offloaded, and whether it can ever be fetched back.
+	"has_object", "content_hidden",
+	// Served tier: scales every token rate.
+	"service_tier", "speed", "inference_geo",
+}
+
+// billingSelectColumns returns the SELECT clause for cost recomputation.
+//
+// The modality payload columns are wrapped in a CASE on object_type so each row pulls
+// only the payload its own request type bills on. This matters most for
+// image_generation_output, which serializes ImageData.B64JSON — full base64 image bytes,
+// megabytes per image. Selecting it unconditionally would pull that for every row in
+// the batch including plain chat rows, and pricing only ever reads len(Data).
+// The same CASE pattern guards output_message in listSelectColumns for realtime turns.
+func (s *RDBLogStore) billingSelectColumns() string {
+	cols := make([]string, 0, len(billingScalarColumns)+len(billingPayloadColumns))
+	cols = append(cols, billingScalarColumns...)
+
+	// Sorted so the generated SQL is stable across calls (map iteration is not).
+	payloadCols := make([]string, 0, len(billingPayloadColumns))
+	for col := range billingPayloadColumns {
+		payloadCols = append(payloadCols, col)
+	}
+	sort.Strings(payloadCols)
+
+	for _, col := range payloadCols {
+		objectTypes := billingPayloadColumns[col]
+		quoted := make([]string, 0, len(objectTypes))
+		for _, t := range objectTypes {
+			quoted = append(quoted, "'"+t+"'")
+		}
+		cols = append(cols, fmt.Sprintf(
+			"CASE WHEN object_type IN (%s) THEN %s ELSE NULL END AS %s",
+			strings.Join(quoted, ", "), col, col,
+		))
+	}
+	return strings.Join(cols, ", ")
+}
+
+// billingPayloadColumnFor returns the payload column an object_type bills on, or ""
+// when the request type prices purely off token counts. Used both to gate the
+// projection and to decide whether a row still needs an object fetch.
+func billingPayloadColumnFor(objectType string) string {
+	for col, objectTypes := range billingPayloadColumns {
+		for _, t := range objectTypes {
+			if t == objectType {
+				return col
+			}
+		}
+	}
+	return ""
+}
+
 // GetStats calculates statistics for logs matching the given filters.
 func (s *RDBLogStore) GetStats(ctx context.Context, filters SearchFilters) (*SearchStats, error) {
 	// Stats has a stricter matview gate than other paths: short windows go to
@@ -1012,7 +1399,9 @@ func (s *RDBLogStore) GetStats(ctx context.Context, filters SearchFilters) (*Sea
 	// consistent with the real-time /api/logs row list. See
 	// canUseMatViewForFreshAggregate.
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatViewForFreshAggregate(filters) {
-		return s.getStatsFromMatView(ctx, filters)
+		if stats, err := s.getStatsFromMatView(ctx, filters); !s.fallBackToRaw(err) {
+			return stats, err
+		}
 	}
 	baseQuery := s.ScopedDB(ctx).Model(&Log{})
 	baseQuery = s.applyFilters(baseQuery, filters)
@@ -1153,10 +1542,10 @@ func (s *RDBLogStore) aggregateCacheHits(ctx context.Context, base *gorm.DB, fil
 	q := s.applyFilters(base, filters)
 	switch s.db.Dialector.Name() {
 	case "postgres":
-		q = q.Where("cache_debug IS NOT NULL AND cache_debug <> '' AND cache_debug ~ '^\\s*\\{.*\\}\\s*$'")
+		q = q.Where(cacheDebugJSONGuard)
 		if err := q.Select(
-			`SUM(CASE WHEN substring(cache_debug from '"hit_type"[[:space:]]*:[[:space:]]*"([^"]+)"') = 'direct'   THEN 1 ELSE 0 END) AS direct_hits, ` +
-				`SUM(CASE WHEN substring(cache_debug from '"hit_type"[[:space:]]*:[[:space:]]*"([^"]+)"') = 'semantic' THEN 1 ELSE 0 END) AS semantic_hits`,
+			`SUM(CASE WHEN ` + cacheDebugHitTypeExpr + ` = 'direct'   THEN 1 ELSE 0 END) AS direct_hits, ` +
+				`SUM(CASE WHEN ` + cacheDebugHitTypeExpr + ` = 'semantic' THEN 1 ELSE 0 END) AS semantic_hits`,
 		).Scan(&result).Error; err != nil {
 			return nil, nil, fmt.Errorf("failed to aggregate cache-hit stats: %w", err)
 		}
@@ -1190,8 +1579,10 @@ func (s *RDBLogStore) GetHistogram(ctx context.Context, filters SearchFilters, b
 	if bucketSizeSeconds <= 0 {
 		bucketSizeSeconds = 3600 // Default to 1 hour
 	}
-	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 && bucketSizeSeconds%3600 == 0 {
+		if res, err := s.getHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	// Determine database type for SQL syntax
@@ -1303,7 +1694,9 @@ func (s *RDBLogStore) GetTokenHistogram(ctx context.Context, filters SearchFilte
 		bucketSizeSeconds = 3600 // Default to 1 hour
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getTokenHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getTokenHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -1422,7 +1815,9 @@ func (s *RDBLogStore) GetThroughputHistogram(ctx context.Context, filters Search
 		bucketSizeSeconds = 3600 // Default to 1 hour
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getThroughputHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getThroughputHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -1509,7 +1904,9 @@ func (s *RDBLogStore) GetProviderThroughputHistogram(ctx context.Context, filter
 		bucketSizeSeconds = 3600
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getProviderThroughputHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getProviderThroughputHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -1602,7 +1999,9 @@ func (s *RDBLogStore) GetCostHistogram(ctx context.Context, filters SearchFilter
 		bucketSizeSeconds = 3600 // Default to 1 hour
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getCostHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getCostHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -1708,7 +2107,9 @@ func (s *RDBLogStore) GetModelHistogram(ctx context.Context, filters SearchFilte
 		bucketSizeSeconds = 3600 // Default to 1 hour
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getModelHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getModelHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -1847,7 +2248,9 @@ func (s *RDBLogStore) GetLatencyHistogram(ctx context.Context, filters SearchFil
 		bucketSizeSeconds = 3600
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getLatencyHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getLatencyHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -2111,7 +2514,9 @@ func (s *RDBLogStore) buildLatencyHistogramResult(computedBuckets map[int64]Late
 // cost-histogram totals shown on the same dashboard.
 func (s *RDBLogStore) GetModelRankings(ctx context.Context, filters SearchFilters) (*ModelRankingResult, error) {
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatViewForFreshAggregate(filters) {
-		return s.getModelRankingsFromMatView(ctx, filters)
+		if res, err := s.getModelRankingsFromMatView(ctx, filters); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 	selectClause := `
 		model,
@@ -2147,11 +2552,10 @@ func (s *RDBLogStore) GetModelRankings(ctx context.Context, filters SearchFilter
 		TPLatencyMs        float64         `gorm:"column:tp_latency_ms"`
 	}
 
-	if err := currentQuery.
+	if err := applyRankingLimit(currentQuery.
 		Select(currentSelectClause).
 		Group("model, provider").
-		Order("total_requests DESC").
-		Limit(defaultMaxRankingsLimit).
+		Order("total_requests DESC, model ASC, provider ASC"), filters).
 		Find(&currentResults).Error; err != nil {
 		return nil, fmt.Errorf("failed to get model rankings: %w", err)
 	}
@@ -2273,7 +2677,9 @@ func (s *RDBLogStore) GetModelRankings(ctx context.Context, filters SearchFilter
 // cost-histogram totals shown on the same dashboard.
 func (s *RDBLogStore) GetUserRankings(ctx context.Context, filters SearchFilters) (*UserRankingResult, error) {
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatViewForFreshAggregate(filters) {
-		return s.getUserRankingsFromMatView(ctx, filters)
+		if res, err := s.getUserRankingsFromMatView(ctx, filters); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 	selectClause := `
 		user_id,
@@ -2295,11 +2701,10 @@ func (s *RDBLogStore) GetUserRankings(ctx context.Context, filters SearchFilters
 		TotalCost     sql.NullFloat64 `gorm:"column:total_cost"`
 	}
 
-	if err := currentQuery.
+	if err := applyRankingLimit(currentQuery.
 		Select(selectClause).
 		Group("user_id").
-		Order("total_requests DESC").
-		Limit(defaultMaxRankingsLimit).
+		Order("total_requests DESC, user_id ASC"), filters).
 		Find(&currentResults).Error; err != nil {
 		return nil, fmt.Errorf("failed to get user rankings: %w", err)
 	}
@@ -2386,29 +2791,28 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		return nil, fmt.Errorf("invalid ranking dimension: %s", dimension)
 	}
 
-	// Every rollup dimension (team / business unit / customer / user / virtual
-	// key) attributes each request to a single owner — the scalar id column — and
-	// buckets owner-less traffic under a synthetic "Unassigned" entry, so
-	// per-dimension spend is additive and reconciles to the org total.
-	bucketed := isBucketedDimension(idCol)
-	groupExpr := idCol
-	if bucketed {
-		groupExpr = bucketedIDExpr(idCol)
-	}
-	baseTable := func(q *gorm.DB) *gorm.DB { return q.Model(&Log{}) }
+	// Team / customer / business unit fan out to every id on the row (the
+	// enterprise user/AP path records the full hierarchy in the JSON-array
+	// columns and leaves the scalar NULL); user / virtual key stay single-owner.
+	// Owner-less rows bucket under a synthetic "Unassigned" entry either way.
+	src := s.dimensionReadSourceFor(idCol, nameCol)
+	groupExpr := src.IDExpr
 
 	// Fresh-aggregate gate (not bare canUseMatView): short windows go to the
 	// raw table because mv_logs_hourly rounds the window out to full hour
 	// buckets, which visibly inflates rankings against the raw-path stats and
 	// cost-histogram totals shown on the same dashboard. Bucketed dimensions
-	// always use the raw path — the matview reader has no Unassigned bucket.
-	if !bucketed && s.db.Dialector.Name() == "postgres" && s.canUseMatViewForFreshAggregate(filters) {
-		return s.getDimensionRankingsFromMatView(ctx, filters, dimension)
+	// always use the raw path — the matview reader has neither an Unassigned
+	// bucket nor the array columns the fan-out needs.
+	if !src.Bucketed && s.db.Dialector.Name() == "postgres" && s.canUseMatViewForFreshAggregate(filters) {
+		if res, err := s.getDimensionRankingsFromMatView(ctx, filters, dimension); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	var nameExpr string
-	if nameCol != "" {
-		nameExpr = fmt.Sprintf("MAX(%s) as name", nameCol)
+	if src.NameCol != "" {
+		nameExpr = fmt.Sprintf("MAX(%s) as name", src.NameCol)
 	} else {
 		nameExpr = "'' as name"
 	}
@@ -2421,10 +2825,10 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		COALESCE(SUM(cost), 0) as total_cost
 	`, groupExpr, nameExpr)
 
-	currentQuery := baseTable(s.ScopedDB(ctx))
+	currentQuery := src.base(s.ScopedDB(ctx))
 	currentQuery = s.applyFilters(currentQuery, filters)
 	currentQuery = currentQuery.Where("status IN ?", terminalLogStatuses)
-	if !bucketed {
+	if !src.Bucketed {
 		currentQuery = currentQuery.Where(fmt.Sprintf("%s IS NOT NULL AND %s != ''", idCol, idCol))
 	}
 
@@ -2436,11 +2840,14 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		TotalCost     sql.NullFloat64 `gorm:"column:total_cost"`
 	}
 
-	if err := currentQuery.
+	if err := applyRankingLimit(currentQuery.
 		Select(selectClause).
 		Group(groupExpr).
-		Order("total_requests DESC").
-		Limit(defaultMaxRankingsLimit).
+		// Tiebreak on the group expression itself, not the `id` alias:
+		// ClickHouse resolves a bare `id` in ORDER BY to the base table's
+		// column (not in GROUP BY -> error 215), while Postgres/SQLite
+		// resolve the alias. The expression works on all three.
+		Order("total_requests DESC, "+groupExpr+" ASC"), filters).
 		Find(&currentResults).Error; err != nil {
 		return nil, fmt.Errorf("failed to get dimension rankings for %s: %w", dimension, err)
 	}
@@ -2452,15 +2859,19 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		}, nil
 	}
 
-	// Single-owner attribution is additive, so attributed == actual. Report the
-	// real total request count (including the Unassigned bucket) so the UI's
-	// totals reconcile to org-wide traffic.
+	// Actual is the real request count over the window (including the Unassigned
+	// bucket) so the UI reconciles to org-wide traffic; it must be counted on the
+	// raw table, never the fan-out relation, or a multi-team request would be
+	// counted once per team. Attributed counts the (request, dimension value)
+	// pairs the rankings are built from, so for a fanned-out dimension it equals
+	// the sum of every ranking row and can exceed actual. Single-owner dimensions
+	// have nothing to fan out, so the two are equal and one count suffices.
 	var requestCounts struct {
 		ActualRequests     int64 `gorm:"column:actual_requests"`
 		AttributedRequests int64 `gorm:"column:attributed_requests"`
 	}
-	if bucketed {
-		countQuery := baseTable(s.ScopedDB(ctx))
+	if src.Bucketed {
+		countQuery := s.ScopedDB(ctx).Model(&Log{})
 		countQuery = s.applyFilters(countQuery, filters)
 		countQuery = countQuery.Where("status IN ?", terminalLogStatuses)
 		var total int64
@@ -2469,6 +2880,17 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		}
 		requestCounts.ActualRequests = total
 		requestCounts.AttributedRequests = total
+
+		if src.FannedOut {
+			attributedQuery := src.base(s.ScopedDB(ctx))
+			attributedQuery = s.applyFilters(attributedQuery, filters)
+			attributedQuery = attributedQuery.Where("status IN ?", terminalLogStatuses)
+			var attributed int64
+			if err := attributedQuery.Count(&attributed).Error; err != nil {
+				return nil, fmt.Errorf("failed to get attributed dimension ranking totals for %s: %w", dimension, err)
+			}
+			requestCounts.AttributedRequests = attributed
+		}
 	}
 
 	prevMap := make(map[string]DimensionRankingEntry)
@@ -2481,10 +2903,13 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		prevFilters.StartTime = &prevStart
 		prevFilters.EndTime = &prevEnd
 
-		prevQuery := baseTable(s.ScopedDB(ctx))
+		// Same relation as the current period: comparing a fanned-out current
+		// period against a scalar previous period would show a fake spike on
+		// every entity that only appears in the array columns.
+		prevQuery := src.base(s.ScopedDB(ctx))
 		prevQuery = s.applyFilters(prevQuery, prevFilters)
 		prevQuery = prevQuery.Where("status IN ?", terminalLogStatuses)
-		if !bucketed {
+		if !src.Bucketed {
 			prevQuery = prevQuery.Where(fmt.Sprintf("%s IS NOT NULL AND %s != ''", idCol, idCol))
 		}
 
@@ -2532,7 +2957,7 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		name := r.Name
 		// Owner-less rows collapse into the synthetic unassigned bucket, whose
 		// scalar name column is empty; give it a stable display label.
-		if bucketed && r.ID == unassignedDimensionID {
+		if src.Bucketed && r.ID == unassignedDimensionID {
 			name = unassignedDimensionName
 		}
 		entry := DimensionRankingEntry{
@@ -2579,7 +3004,9 @@ func (s *RDBLogStore) GetProviderCostHistogram(ctx context.Context, filters Sear
 		bucketSizeSeconds = 3600
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getProviderCostHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getProviderCostHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -2674,7 +3101,9 @@ func (s *RDBLogStore) GetProviderTokenHistogram(ctx context.Context, filters Sea
 		bucketSizeSeconds = 3600
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getProviderTokenHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getProviderTokenHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -2781,7 +3210,9 @@ func (s *RDBLogStore) GetProviderLatencyHistogram(ctx context.Context, filters S
 		bucketSizeSeconds = 3600
 	}
 	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getProviderLatencyHistogramFromMatView(ctx, filters, bucketSizeSeconds)
+		if res, err := s.getProviderLatencyHistogramFromMatView(ctx, filters, bucketSizeSeconds); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 
 	dialect := s.db.Dialector.Name()
@@ -3124,30 +3555,31 @@ func (s *RDBLogStore) buildProviderLatencyHistogramResult(computedBuckets map[in
 // GetDimensionCostHistogram returns time-bucketed cost data grouped by the specified dimension.
 // Uses the mv_logs_hourly materialized view on PostgreSQL when eligible; falls back to raw queries otherwise.
 func (s *RDBLogStore) GetDimensionCostHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64, dimension HistogramDimension) (*DimensionCostHistogramResult, error) {
-	if !ValidHistogramDimensions[dimension] {
+	dimCol, ok := histogramDimensionColumn(dimension)
+	if !ok {
 		return nil, fmt.Errorf("invalid histogram dimension: %s", dimension)
 	}
 	if bucketSizeSeconds <= 0 {
 		bucketSizeSeconds = 3600
 	}
-	dimCol := string(dimension)
 	dialect := s.db.Dialector.Name()
-	// Rollup dimensions (team / business unit / customer / user / virtual key)
-	// attribute each request to a single owner and bucket owner-less traffic as
-	// "unassigned", so the per-dimension breakdown is additive and the bucket
-	// totals reconcile to org spend. Bucketed dimensions use the raw path — the
-	// matview reader has no unassigned bucket.
-	bucketed := isBucketedDimension(dimCol)
-	dimValueExpr := fmt.Sprintf("COALESCE(%s, '')", dimCol)
-	groupCol := dimCol
-	if bucketed {
-		dimValueExpr = bucketedIDExpr(dimCol)
-		groupCol = dimValueExpr
+	// Rollup dimensions bucket owner-less traffic as "unassigned"; team /
+	// customer / business unit additionally fan out to every id the row carries.
+	// Both force the raw path — the matview reader has neither the unassigned
+	// bucket nor the array columns.
+	src := s.dimensionReadSourceFor(dimCol, "")
+	dimValueExpr := src.IDExpr
+	groupCol := dimValueExpr
+	if !src.Bucketed {
+		dimValueExpr = fmt.Sprintf("COALESCE(%s, '')", dimCol)
+		groupCol = dimCol
 	}
-	if !bucketed && dialect == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getDimensionCostHistogramFromMatView(ctx, filters, bucketSizeSeconds, dimension)
+	if !src.Bucketed && dialect == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
+		if res, err := s.getDimensionCostHistogramFromMatView(ctx, filters, bucketSizeSeconds, dimension); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
-	baseQuery := s.ScopedDB(ctx).Model(&Log{})
+	baseQuery := src.base(s.ScopedDB(ctx))
 	baseQuery = s.applyFilters(baseQuery, filters)
 	baseQuery = baseQuery.Where("status IN ?", terminalLogStatuses)
 	baseQuery = baseQuery.Where("cost IS NOT NULL AND cost > 0")
@@ -3225,29 +3657,31 @@ func (s *RDBLogStore) GetDimensionCostHistogram(ctx context.Context, filters Sea
 // GetDimensionTokenHistogram returns time-bucketed token usage grouped by the specified dimension.
 // Uses the mv_logs_hourly materialized view on PostgreSQL when eligible; falls back to raw queries otherwise.
 func (s *RDBLogStore) GetDimensionTokenHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64, dimension HistogramDimension) (*DimensionTokenHistogramResult, error) {
-	if !ValidHistogramDimensions[dimension] {
+	dimCol, ok := histogramDimensionColumn(dimension)
+	if !ok {
 		return nil, fmt.Errorf("invalid histogram dimension: %s", dimension)
 	}
 	if bucketSizeSeconds <= 0 {
 		bucketSizeSeconds = 3600
 	}
-	dimCol := string(dimension)
 	dialect := s.db.Dialector.Name()
-	// Internal org-rollup dimensions (team / business unit / customer) attribute
-	// each request to a single owner and bucket owner-less traffic as
-	// "unassigned", so the per-dimension breakdown is additive. Bucketed
-	// dimensions use the raw path — the matview reader has no unassigned bucket.
-	bucketed := isBucketedDimension(dimCol)
-	dimValueExpr := fmt.Sprintf("COALESCE(%s, '')", dimCol)
-	groupCol := dimCol
-	if bucketed {
-		dimValueExpr = bucketedIDExpr(dimCol)
-		groupCol = dimValueExpr
+	// Rollup dimensions bucket owner-less traffic as "unassigned"; team /
+	// customer / business unit additionally fan out to every id the row carries.
+	// Both force the raw path — the matview reader has neither the unassigned
+	// bucket nor the array columns.
+	src := s.dimensionReadSourceFor(dimCol, "")
+	dimValueExpr := src.IDExpr
+	groupCol := dimValueExpr
+	if !src.Bucketed {
+		dimValueExpr = fmt.Sprintf("COALESCE(%s, '')", dimCol)
+		groupCol = dimCol
 	}
-	if !bucketed && dialect == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getDimensionTokenHistogramFromMatView(ctx, filters, bucketSizeSeconds, dimension)
+	if !src.Bucketed && dialect == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
+		if res, err := s.getDimensionTokenHistogramFromMatView(ctx, filters, bucketSizeSeconds, dimension); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
-	baseQuery := s.ScopedDB(ctx).Model(&Log{})
+	baseQuery := src.base(s.ScopedDB(ctx))
 	baseQuery = s.applyFilters(baseQuery, filters)
 	baseQuery = baseQuery.Where("status IN ?", terminalLogStatuses)
 
@@ -3346,18 +3780,31 @@ func (s *RDBLogStore) GetDimensionTokenHistogram(ctx context.Context, filters Se
 // Uses the mv_logs_hourly materialized view on PostgreSQL when eligible; falls back to raw queries otherwise.
 // The fallback path computes AVG latency only (no percentiles) since percentile_cont is Postgres-specific.
 func (s *RDBLogStore) GetDimensionLatencyHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64, dimension HistogramDimension) (*DimensionLatencyHistogramResult, error) {
-	if !ValidHistogramDimensions[dimension] {
+	dimCol, ok := histogramDimensionColumn(dimension)
+	if !ok {
 		return nil, fmt.Errorf("invalid histogram dimension: %s", dimension)
 	}
 	if bucketSizeSeconds <= 0 {
 		bucketSizeSeconds = 3600
 	}
-	if s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
-		return s.getDimensionLatencyHistogramFromMatView(ctx, filters, bucketSizeSeconds, dimension)
+	// Rollup dimensions bucket owner-less traffic as "unassigned"; team /
+	// customer / business unit additionally fan out to every id the row carries.
+	// Both force the raw path — the matview reader has neither the unassigned
+	// bucket nor the array columns.
+	src := s.dimensionReadSourceFor(dimCol, "")
+	dimValueExpr := src.IDExpr
+	groupCol := dimValueExpr
+	if !src.Bucketed {
+		dimValueExpr = fmt.Sprintf("COALESCE(%s, '')", dimCol)
+		groupCol = dimCol
 	}
-	dimCol := string(dimension)
+	if !src.Bucketed && s.db.Dialector.Name() == "postgres" && s.canUseMatView(filters) && bucketSizeSeconds >= 3600 {
+		if res, err := s.getDimensionLatencyHistogramFromMatView(ctx, filters, bucketSizeSeconds, dimension); !s.fallBackToRaw(err) {
+			return res, err
+		}
+	}
 	dialect := s.db.Dialector.Name()
-	baseQuery := s.ScopedDB(ctx).Model(&Log{})
+	baseQuery := src.base(s.ScopedDB(ctx))
 	baseQuery = s.applyFilters(baseQuery, filters)
 	baseQuery = baseQuery.Where("status IN ?", terminalLogStatuses)
 	baseQuery = baseQuery.Where("latency IS NOT NULL")
@@ -3372,11 +3819,11 @@ func (s *RDBLogStore) GetDimensionLatencyHistogram(ctx context.Context, filters 
 	}
 	if err := baseQuery.Select(fmt.Sprintf(`
 		%s AS bucket_timestamp,
-		COALESCE(%s, '') AS dim_value,
+		%s AS dim_value,
 		COALESCE(AVG(latency), 0) AS avg_lat,
 		COUNT(*) AS total_requests
-	`, bucketExpr, dimCol)).
-		Group(fmt.Sprintf("bucket_timestamp, %s", dimCol)).
+	`, bucketExpr, dimValueExpr)).
+		Group(fmt.Sprintf("bucket_timestamp, %s", groupCol)).
 		Order("bucket_timestamp ASC").
 		Find(&results).Error; err != nil {
 		return nil, err
@@ -3507,7 +3954,9 @@ func (s *RDBLogStore) applyLikeFilter(q *gorm.DB, column, search string) *gorm.D
 // Scoped to recent data to avoid full table scans.
 func (s *RDBLogStore) GetDistinctModels(ctx context.Context, limit int, query string) ([]string, error) {
 	if s.db.Dialector.Name() == "postgres" && s.matViewsReady.Load() {
-		return s.getDistinctModelsFromMatView(ctx, limit, query)
+		if res, err := s.getDistinctModelsFromMatView(ctx, limit, query); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -defaultFilterDataCutoffDays)
 	var models []string
@@ -3529,7 +3978,9 @@ func (s *RDBLogStore) GetDistinctModels(ctx context.Context, limit int, query st
 // Scoped to recent data to avoid full table scans.
 func (s *RDBLogStore) GetDistinctAliases(ctx context.Context, limit int, query string) ([]string, error) {
 	if s.db.Dialector.Name() == "postgres" && s.matViewsReady.Load() {
-		return s.getDistinctAliasesFromMatView(ctx, limit, query)
+		if res, err := s.getDistinctAliasesFromMatView(ctx, limit, query); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -defaultFilterDataCutoffDays)
 	var aliases []string
@@ -3567,15 +4018,14 @@ var allowedKeyPairColumns = map[string]struct{}{
 // GetDistinctKeyPairs returns unique non-empty ID-Name pairs for the given columns using SELECT DISTINCT.
 // idCol and nameCol must be valid column names (e.g., "selected_key_id", "selected_key_name").
 //
-// Matview path is DAC-aware: each per-dimension matview carries the
-// visibility columns (user_id, team_id, virtual_key_id), so a
-// QueryScope on ctx applies on the matview directly. Until
-// matViewsReady the raw-table fallback (also ScopedDB-aware) serves
-// requests.
+// Matview path is DAC-aware: each per-dimension matview carries every
+// visibility column a scope can predicate on (see scopeProjection), so a
+// QueryScope on ctx applies on the matview directly. Until matViewsReady
+// the raw-table fallback (also ScopedDB-aware) serves requests.
 func (s *RDBLogStore) GetDistinctKeyPairs(ctx context.Context, idCol, nameCol string, limit int, query string) ([]KeyPairResult, error) {
 	if s.db.Dialector.Name() == "postgres" && s.matViewsReady.Load() {
 		results, served, err := s.getDistinctKeyPairsFromMatView(ctx, idCol, nameCol, limit, query)
-		if served {
+		if served && !s.fallBackToRaw(err) {
 			return results, err
 		}
 	}
@@ -3605,7 +4055,9 @@ func (s *RDBLogStore) GetDistinctKeyPairs(ctx context.Context, idCol, nameCol st
 // Scoped to recent data to avoid full table scans.
 func (s *RDBLogStore) GetDistinctRoutingEngines(ctx context.Context, limit int, query string) ([]string, error) {
 	if s.db.Dialector.Name() == "postgres" && s.matViewsReady.Load() {
-		return s.getDistinctRoutingEnginesFromMatView(ctx, limit, query)
+		if res, err := s.getDistinctRoutingEnginesFromMatView(ctx, limit, query); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -defaultFilterDataCutoffDays)
 	var rawValues []string
@@ -3645,7 +4097,9 @@ func (s *RDBLogStore) GetDistinctRoutingEngines(ctx context.Context, limit int, 
 // Scoped to recent data to avoid full table scans.
 func (s *RDBLogStore) GetDistinctStopReasons(ctx context.Context, limit int, query string) ([]string, error) {
 	if s.db.Dialector.Name() == "postgres" && s.matViewsReady.Load() {
-		return s.getDistinctStopReasonsFromMatView(ctx, limit, query)
+		if res, err := s.getDistinctStopReasonsFromMatView(ctx, limit, query); !s.fallBackToRaw(err) {
+			return res, err
+		}
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -defaultFilterDataCutoffDays)
 	var stopReasons []string
@@ -4048,10 +4502,12 @@ func (s *RDBLogStore) BatchCreateMCPToolLogsIfNotExists(ctx context.Context, ent
 	}).Create(&entries).Error
 }
 
-// FindMCPToolLog retrieves a single MCP tool log entry by its ID.
+// FindMCPToolLog retrieves a single MCP tool log entry by its ID. When ctx
+// carries a QueryScope, ScopedDB applies it so out-of-scope IDs return
+// ErrNotFound. Contexts without a QueryScope stay unscoped as before.
 func (s *RDBLogStore) FindMCPToolLog(ctx context.Context, id string) (*MCPToolLog, error) {
 	var log MCPToolLog
-	if err := s.db.WithContext(ctx).Where("id = ?", id).First(&log).Error; err != nil {
+	if err := s.ScopedDB(ctx).Where("id = ?", id).First(&log).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrNotFound
 		}
