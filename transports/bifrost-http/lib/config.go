@@ -666,7 +666,7 @@ var DefaultClientConfig = configstore.ClientConfig{
 	WhitelistedRoutes:               []string{},
 	MaxRequestBodySizeMB:            100,
 	MCPAgentDepth:                   10,
-	MCPToolExecutionTimeout:         30,
+	MCPToolExecutionTimeout:         int(schemas.DefaultToolExecutionTimeout / time.Second),
 	MCPCodeModeBindingLevel:         string(schemas.CodeModeBindingLevelServer),
 	MCPEnableTempTokenAuth:          false,
 	HideDeletedVirtualKeysInFilters: false,

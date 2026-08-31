@@ -810,7 +810,7 @@ export const coreConfigSchema = z.object({
 	allowed_origins: z.array(z.string()).default(["*"]),
 	max_request_body_size_mb: z.number().min(1).default(100),
 	mcp_agent_depth: z.number().min(1).default(10),
-	mcp_tool_execution_timeout: z.number().min(1).default(30),
+	mcp_tool_execution_timeout: z.number().min(1).default(180),
 	mcp_code_mode_binding_level: z.enum(["server", "tool"]).default("server"),
 	mcp_disable_auto_tool_inject: z.boolean().default(false),
 	mcp_enable_temp_token_auth: z.boolean().default(false),

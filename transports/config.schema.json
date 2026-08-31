@@ -267,7 +267,7 @@
           "type": "integer",
           "minimum": 1,
           "description": "DEPRECATED: Timeout for individual MCP tool execution in seconds. Use mcp.tool_manager_config.tool_execution_timeout.",
-          "default": 30
+          "default": 180
         },
         "mcp_code_mode_binding_level": {
           "type": "string",
@@ -5284,9 +5284,9 @@
       "properties": {
         "tool_execution_timeout": {
           "type": ["integer", "string"],
-          "description": "Tool execution timeout. Accepts a duration string (e.g. \"30s\", \"2m\") or an integer number of seconds (e.g. 30 means 30 seconds).",
+          "description": "Tool execution timeout. Accepts a duration string (e.g. \"180s\", \"2m\") or an integer number of seconds (e.g. 180 means 180 seconds).",
           "minimum": 1,
-          "default": 30
+          "default": 180
         },
         "max_agent_depth": {
           "type": "integer",

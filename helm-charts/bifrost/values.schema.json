@@ -511,7 +511,7 @@
               "type": "integer",
               "minimum": 1,
               "description": "DEPRECATED: Timeout for individual MCP tool execution in seconds. Use bifrost.mcp.toolManagerConfig.toolExecutionTimeout.",
-              "default": 30
+              "default": 180
             },
             "mcpCodeModeBindingLevel": {
               "type": "string",
@@ -724,8 +724,8 @@
               "properties": {
                 "toolExecutionTimeout": {
                   "type": ["integer", "string"],
-                  "description": "Tool execution timeout. Integer = seconds (e.g. 30), string = Go duration (e.g. \"30s\", \"2m\"). Prefer the string form.",
-                  "default": "30s"
+                  "description": "Tool execution timeout. Integer = seconds (e.g. 180), string = Go duration (e.g. \"180s\", \"2m\"). Prefer the string form.",
+                  "default": "180s"
                 },
                 "maxAgentDepth": {
                   "type": "integer",

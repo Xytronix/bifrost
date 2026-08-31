@@ -315,8 +315,11 @@ func (c *MCPToolManagerConfig) UnmarshalJSON(data []byte) error {
 }
 
 const (
-	DefaultMaxAgentDepth        = 10
-	DefaultToolExecutionTimeout = 30 * time.Second
+	DefaultMaxAgentDepth = 10
+	// DefaultToolExecutionTimeout is the global per-tool deadline when neither
+	// tool_manager_config nor a per-client override is set. 30s is too short
+	// for IMAP/EWS/SSH-backed MCP servers; 3 minutes still bounds hung backends.
+	DefaultToolExecutionTimeout = 180 * time.Second
 )
 
 // CodeModeBindingLevel defines how tools are exposed in the VFS for code execution
