@@ -1108,3 +1108,79 @@ func TestCallMCPToolDoesNotEchoRawResponseIntoLogs(t *testing.T) {
 		t.Fatalf("raw tool response leaked into execution logs (would be sent to the model twice):\n%s", joined)
 	}
 }
+
+func newDelayInProcessClient(t *testing.T, toolName string) *client.Client {
+	t.Helper()
+	srv := server.NewMCPServer("delay-server", "1.0.0", server.WithToolCapabilities(true))
+	srv.AddTool(
+		mcp.NewTool(toolName, mcp.WithDescription("delay tool"), mcp.WithNumber("seconds", mcp.Required(), mcp.Description("seconds to sleep"))),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			seconds, _ := req.GetArguments()["seconds"].(float64)
+			timer := time.NewTimer(time.Duration(seconds * float64(time.Second)))
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				return mcp.NewToolResultText("ok"), nil
+			case <-ctx.Done():
+				return mcp.NewToolResultError("timed out"), nil
+			}
+		},
+	)
+	c, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatalf("NewInProcessClient: %v", err)
+	}
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("client.Start: %v", err)
+	}
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{Name: "test-client", Version: "1.0.0"}
+	if _, err := c.Initialize(context.Background(), initReq); err != nil {
+		t.Fatalf("client.Initialize: %v", err)
+	}
+	return c
+}
+
+// TestCallMCPToolHonorsPerClientTimeout pins executeToolCode inner calls using
+// the per-client ToolExecutionTimeout instead of only the global code-mode budget.
+func TestCallMCPToolHonorsPerClientTimeout(t *testing.T) {
+	const toolName = "delay"
+	const clientName = "slowmail"
+
+	conn := newDelayInProcessClient(t, toolName)
+	defer conn.Close()
+
+	mode := NewStarlarkCodeMode(&codemcp.CodeModeConfig{
+		BindingLevel:         schemas.CodeModeBindingLevelTool,
+		ToolExecutionTimeout: 5 * time.Second,
+	}, nil)
+	mode.clientManager = &testClientManager{
+		clients: map[string]*schemas.MCPClientState{
+			clientName: {
+				Name: clientName,
+				ExecutionConfig: &schemas.MCPClientConfig{
+					Name:                 clientName,
+					ToolExecutionTimeout: 200 * time.Millisecond,
+				},
+			},
+		},
+		tools: map[string][]schemas.ChatTool{
+			clientName: {{Function: &schemas.ChatToolFunction{Name: toolName}}},
+		},
+		conn: conn,
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	start := time.Now()
+	result, err := mode.callMCPTool(ctx, clientName, toolName, map[string]interface{}{"seconds": 2.0}, func(string) {})
+	elapsed := time.Since(start)
+	if elapsed > time.Second {
+		t.Fatalf("per-client timeout (200ms) should fire well before the 2s delay; took %v (err=%v result=%v)", elapsed, err, result)
+	}
+	if err == nil {
+		if s, ok := result.(string); ok && s == "ok" {
+			t.Fatal("delay completed instead of timing out")
+		}
+	}
+}

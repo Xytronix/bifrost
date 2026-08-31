@@ -491,6 +491,9 @@ func (s *StarlarkCodeMode) callMCPTool(ctx *schemas.BifrostContext, clientName, 
 	defer release()
 
 	toolExecutionTimeout := s.getToolExecutionTimeout()
+	if client.ExecutionConfig != nil && client.ExecutionConfig.ToolExecutionTimeout > 0 {
+		toolExecutionTimeout = client.ExecutionConfig.ToolExecutionTimeout
+	}
 
 	// Delegate to the canonical plugin gate. RunWithPluginPipeline owns the
 	// tracing span, MCPRequestType/ClientName/ToolName stamping (via

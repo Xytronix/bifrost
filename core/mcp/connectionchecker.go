@@ -24,7 +24,11 @@ const (
 	// do, self-resolving" rather than confusing.
 	UnstableConnectionCheckInterval = 10 * time.Second
 	// ConnectionCheckTimeout bounds each individual ping/list_tools attempt.
-	ConnectionCheckTimeout = 5 * time.Second
+	// Deadline-exceeded is treated as permanent (not retried), so this must
+	// cover a slow tools/list — the connect path already allows 30s
+	// (MCPClientConnectionEstablishTimeout). 5s left large catalogs stale
+	// until a forced reconnect.
+	ConnectionCheckTimeout = 30 * time.Second
 )
 
 // ClientConnectionChecker is the single periodic mechanism behind a client's
