@@ -29,3 +29,13 @@ func TestWithReasoningEffortTiers_ImpliesReasoningOnEmptyParams(t *testing.T) {
 
 	assert.Equal(t, []string{"reasoning", "reasoning_effort:low", "reasoning_effort:high"}, got)
 }
+
+func TestGeminiFlashFamilyEfforts_36PlusOnly(t *testing.T) {
+	assert.Equal(t, []string{"low", "medium", "high"}, geminiFlashFamilyEfforts("omp-gw/google-antigravity/gemini-3.8-flash"))
+	assert.Equal(t, []string{"low", "medium", "high"}, geminiFlashFamilyEfforts("gemini-3.6-flash"))
+	assert.Equal(t, []string{"low", "medium", "high"}, geminiFlashFamilyEfforts("gemini-3.7-flash"))
+	assert.Nil(t, geminiFlashFamilyEfforts("gemini-3.5-flash"))
+	assert.Nil(t, geminiFlashFamilyEfforts("gemini-3.8-flash-lite"))
+	assert.Nil(t, geminiFlashFamilyEfforts("gemini-3.1-pro"))
+	assert.Nil(t, geminiFlashFamilyEfforts("claude-opus-5"))
+}

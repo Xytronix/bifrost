@@ -963,6 +963,15 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 		if len(efforts) == 0 && modelEntry.Alias != nil {
 			efforts = reasoningEffortsForModel(catalog, *modelEntry.Alias)
 		}
+		if len(efforts) == 0 {
+			efforts = geminiFlashFamilyEfforts(modelName)
+			if len(efforts) == 0 && modelEntry.Alias != nil {
+				efforts = geminiFlashFamilyEfforts(*modelEntry.Alias)
+			}
+		}
+		if len(modelEntry.SupportedParameters) == 0 && len(geminiFlashFamilyEfforts(modelName)) > 0 {
+			modelEntry.SupportedParameters = geminiFlashFamilySupportedParams()
+		}
 		if len(efforts) > 0 {
 			modelEntry.SupportedParameters = withReasoningEffortTiers(modelEntry.SupportedParameters, efforts)
 		}
@@ -1156,6 +1165,25 @@ func supportedParamsForModel(catalog *modelcatalog.ModelCatalog, model string) [
 // models.dev overlay, walking the same candidate forms as
 // supportedParamsForModel so aggregator and effort-suffixed aliases
 // ("omp-gw/anthropic/claude-opus-5", "claude-opus-5-high") reach the base model.
+// geminiFlashFamilyEfforts is the CCA ladder for Gemini Flash 3.6+ when the
+// datasheet and models.dev overlay have no row yet. 3.6/3.7 Flash already
+// advertise low/medium/high; 3.8 listed as id+owned_by only until those
+// catalogs catch up. MINIMAL is omitted: Cloud Code Assist rejects it on
+// these SKUs. Lite/image variants are not this family.
+func geminiFlashFamilyEfforts(model string) []string {
+	name := lastPathSegment(model)
+	if geminiFlashFamilyPattern.MatchString(name) {
+		return []string{"low", "medium", "high"}
+	}
+	return nil
+}
+
+var geminiFlashFamilyPattern = regexp.MustCompile(`(?i)^gemini-3\.(?:[6-9]|[1-9][0-9]+)-flash$`)
+
+func geminiFlashFamilySupportedParams() []string {
+	return []string{"tools", "parallel_tool_calls", "tool_choice", "reasoning"}
+}
+
 func reasoningEffortsForModel(catalog *modelcatalog.ModelCatalog, model string) []string {
 	seen := map[string]bool{}
 	for _, cand := range modelResolutionCandidates(model) {
