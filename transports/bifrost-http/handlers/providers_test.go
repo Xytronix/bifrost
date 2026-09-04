@@ -2076,10 +2076,11 @@ func TestInvalidateListModelsCache_DropsAllEntries(t *testing.T) {
 	}
 }
 
-// A completed catalog refresh must not detach a cold-start waiter from the
-// entry its in-flight fill will update. Expire that entry in place; completed
-// entries can still be dropped so the next request cannot serve old models.
-func TestInvalidateListModelsCacheAfterRefresh_PreservesInFlightEntry(t *testing.T) {
+// Refresh completion must expire snapshots in place: the next request serves
+// the last-known-good response immediately while refreshing it in the
+// background, and an existing cold-start waiter keeps the pointer its fill
+// updates.
+func TestMarkListModelsCacheStale_PreservesSnapshotsAndInFlightEntries(t *testing.T) {
 	inFlight := &listAllModelsCacheEntry{
 		resp: &schemas.BifrostListModelsResponse{
 			Data: []schemas.Model{{ID: "omp-gw/old-model"}},
@@ -2087,30 +2088,36 @@ func TestInvalidateListModelsCacheAfterRefresh_PreservesInFlightEntry(t *testing
 		at:   time.Now(),
 		done: make(chan struct{}),
 	}
+	complete := &listAllModelsCacheEntry{
+		resp: &schemas.BifrostListModelsResponse{
+			Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+		},
+		at: time.Now(),
+	}
 	listAllModelsCacheMu.Lock()
 	listAllModelsCache = map[string]*listAllModelsCacheEntry{
 		"vk-in-flight:omp-gw:false": inFlight,
-		"vk-complete:omp-gw:false": {
-			resp: &schemas.BifrostListModelsResponse{
-				Data: []schemas.Model{{ID: "omp-gw/old-model"}},
-			},
-			at: time.Now(),
-		},
+		"vk-complete:omp-gw:false":  complete,
 	}
 	listAllModelsCacheMu.Unlock()
 	t.Cleanup(InvalidateListModelsCache)
 
-	InvalidateListModelsCacheAfterRefresh()
+	MarkListModelsCacheStale()
 
 	listAllModelsCacheMu.Lock()
 	defer listAllModelsCacheMu.Unlock()
 	if got := listAllModelsCache["vk-in-flight:omp-gw:false"]; got != inFlight {
 		t.Fatalf("in-flight cache entry was detached: got %p, want %p", got, inFlight)
 	}
-	if !inFlight.at.IsZero() {
-		t.Fatalf("in-flight cache entry timestamp got %v, want zero", inFlight.at)
+	if got := listAllModelsCache["vk-complete:omp-gw:false"]; got != complete {
+		t.Fatalf("completed cache entry was detached: got %p, want %p", got, complete)
 	}
-	if _, ok := listAllModelsCache["vk-complete:omp-gw:false"]; ok {
-		t.Fatal("completed stale cache entry was not dropped")
+	for key, entry := range listAllModelsCache {
+		if entry.resp == nil {
+			t.Fatalf("cached response %q was discarded", key)
+		}
+		if !entry.at.IsZero() {
+			t.Fatalf("cache entry %q timestamp got %v, want zero", key, entry.at)
+		}
 	}
 }

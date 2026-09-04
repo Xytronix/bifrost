@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
@@ -307,24 +308,46 @@ func primeListModelsCacheForRefreshTest(t *testing.T) {
 	t.Helper()
 	listAllModelsCacheMu.Lock()
 	listAllModelsCache = map[string]*listAllModelsCacheEntry{
-		"vk:openai:false": {},
+		"vk:openai:false": {
+			resp: &schemas.BifrostListModelsResponse{
+				Data: []schemas.Model{{ID: "openai/old-model"}},
+			},
+			at: time.Now(),
+		},
 	}
 	listAllModelsCacheMu.Unlock()
 	t.Cleanup(InvalidateListModelsCache)
 }
 
-func requireListModelsCacheSize(t *testing.T, want int) {
+func requireListModelsCacheStale(t *testing.T) {
 	t.Helper()
 	listAllModelsCacheMu.Lock()
 	defer listAllModelsCacheMu.Unlock()
-	if len(listAllModelsCache) != want {
-		t.Fatalf("list-model cache size got %d, want %d: %#v", len(listAllModelsCache), want, listAllModelsCache)
+	if len(listAllModelsCache) != 1 {
+		t.Fatalf("list-model cache size got %d, want 1: %#v", len(listAllModelsCache), listAllModelsCache)
+	}
+	for _, entry := range listAllModelsCache {
+		if entry == nil || entry.resp == nil {
+			t.Fatalf("refresh discarded the cached response: %#v", entry)
+		}
+		if !entry.at.IsZero() {
+			t.Fatalf("refresh left the cached response fresh at %v", entry.at)
+		}
 	}
 }
 
-func requireListModelsCacheEmpty(t *testing.T) {
+func requireListModelsCacheFresh(t *testing.T) {
 	t.Helper()
-	requireListModelsCacheSize(t, 0)
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if len(listAllModelsCache) != 1 {
+		t.Fatalf("list-model cache size got %d, want 1: %#v", len(listAllModelsCache), listAllModelsCache)
+	}
+	for _, entry := range listAllModelsCache {
+		if entry == nil || entry.resp == nil || entry.at.IsZero() {
+			t.Fatalf("failed refresh changed the warmed cache entry: %#v", entry)
+		}
+	}
 }
 
 func TestRefreshProviderModels_DelegatesToModelsManager(t *testing.T) {
@@ -342,7 +365,7 @@ func TestRefreshProviderModels_DelegatesToModelsManager(t *testing.T) {
 	if len(mgr.refreshProviderCalls) != 1 || mgr.refreshProviderCalls[0] != "openai" {
 		t.Fatalf("expected one provider-level refresh for openai, got %v", mgr.refreshProviderCalls)
 	}
-	requireListModelsCacheEmpty(t)
+	requireListModelsCacheStale(t)
 }
 
 func TestRefreshProviderKeyModels_DelegatesToModelsManager(t *testing.T) {
@@ -361,7 +384,7 @@ func TestRefreshProviderKeyModels_DelegatesToModelsManager(t *testing.T) {
 	if len(mgr.refreshKeyCalls) != 1 || mgr.refreshKeyCalls[0].keyID != "key-1" {
 		t.Fatalf("expected one refresh for key-1, got %v", mgr.refreshKeyCalls)
 	}
-	requireListModelsCacheEmpty(t)
+	requireListModelsCacheStale(t)
 }
 
 // A refresh already running for the provider must surface as 409 rather than
@@ -379,7 +402,7 @@ func TestRefreshProviderModels_InFlightReturns409(t *testing.T) {
 	if ctx.Response.StatusCode() != fasthttp.StatusConflict {
 		t.Fatalf("status got %d, want 409; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
 	}
-	requireListModelsCacheSize(t, 1)
+	requireListModelsCacheFresh(t)
 }
 
 func TestRefreshProviderModels_FailurePreservesCache(t *testing.T) {
@@ -394,7 +417,7 @@ func TestRefreshProviderModels_FailurePreservesCache(t *testing.T) {
 	if ctx.Response.StatusCode() != fasthttp.StatusInternalServerError {
 		t.Fatalf("status got %d, want 500; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
 	}
-	requireListModelsCacheSize(t, 1)
+	requireListModelsCacheFresh(t)
 }
 
 func TestRefreshProviderKeyModels_UnknownKeyReturns404(t *testing.T) {

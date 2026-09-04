@@ -1399,7 +1399,7 @@ func (s *BifrostHTTPServer) RefreshAllLiveModels(ctx context.Context) {
 		}(provider, keys)
 	}
 	wg.Wait()
-	handlers.InvalidateListModelsCacheAfterRefresh()
+	handlers.MarkListModelsCacheStale()
 }
 
 // liveRefreshJitterFraction spreads each refresh cycle over

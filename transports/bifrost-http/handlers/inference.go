@@ -1303,19 +1303,17 @@ func InvalidateListModelsCache() {
 	listAllModelsCacheMu.Unlock()
 }
 
-// InvalidateListModelsCacheAfterRefresh drops completed snapshots after a
-// successful live-catalog refresh, but preserves entries already being filled.
-// Cold-start waiters retain the same entry pointer their fill updates; the zero
-// timestamp also makes a failed in-flight fill retry on the next request.
-func InvalidateListModelsCacheAfterRefresh() {
+// MarkListModelsCacheStale expires every cached GET /v1/models snapshot in
+// place after a successful live-catalog refresh. The next request serves the
+// last-known-good response immediately while starting a background refill;
+// in-flight cold-start waiters also retain the entry pointer their fill updates.
+func MarkListModelsCacheStale() {
 	listAllModelsCacheMu.Lock()
 	defer listAllModelsCacheMu.Unlock()
-	for key, entry := range listAllModelsCache {
-		if entry != nil && entry.done != nil {
+	for _, entry := range listAllModelsCache {
+		if entry != nil {
 			entry.at = time.Time{}
-			continue
 		}
-		delete(listAllModelsCache, key)
 	}
 }
 

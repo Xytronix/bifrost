@@ -344,7 +344,7 @@ func (h *ProviderHandler) refreshProviderModels(ctx *fasthttp.RequestCtx) {
 
 	// The live catalog now reflects this pass; do not leave a warm unfiltered
 	// /v1/models response serving the pre-refresh snapshot for its remaining TTL.
-	InvalidateListModelsCacheAfterRefresh()
+	MarkListModelsCacheStale()
 
 	// Read back after the refresh so the caller sees the statuses this pass
 	// produced rather than the ones it started from.
@@ -392,7 +392,7 @@ func (h *ProviderHandler) refreshProviderKeyModels(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Keep the externally served model list in lockstep with the refreshed key.
-	InvalidateListModelsCacheAfterRefresh()
+	MarkListModelsCacheStale()
 
 	refreshedKey, err := h.inMemoryStore.GetProviderKeyRedacted(provider, keyID)
 	if err != nil {
