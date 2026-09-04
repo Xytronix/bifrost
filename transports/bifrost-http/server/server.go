@@ -1364,11 +1364,12 @@ const liveRefreshProviderConcurrency = 4
 // Config accessors, which take Config.Mu.RLock and hand back copies, rather
 // than ranging Config.Providers directly.
 //
-// Deliberately does not invalidate anything first. Key and provider removals
-// already prune the cache through the CRUD handlers, and
-// FetchAndStoreLiveForKey writes nothing when a fetch fails, so leaving
-// entries in place keeps last-known-good models routable across a transient
-// upstream error instead of emptying a catalog that was healthy a moment ago.
+// Deliberately does not invalidate live catalog entries first. Key and provider
+// removals already prune them through the CRUD handlers, and
+// FetchAndStoreLiveForKey writes nothing when a fetch fails, so leaving entries
+// in place keeps last-known-good models routable across a transient upstream
+// error. The HTTP response cache is invalidated after the pass so callers see
+// that current last-known-good snapshot immediately.
 func (s *BifrostHTTPServer) RefreshAllLiveModels(ctx context.Context) {
 	if s.Config == nil || s.Config.ModelCatalog == nil || s.Client == nil {
 		return
@@ -1398,6 +1399,7 @@ func (s *BifrostHTTPServer) RefreshAllLiveModels(ctx context.Context) {
 		}(provider, keys)
 	}
 	wg.Wait()
+	handlers.InvalidateListModelsCacheAfterRefresh()
 }
 
 // liveRefreshJitterFraction spreads each refresh cycle over

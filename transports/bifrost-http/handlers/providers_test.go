@@ -2075,3 +2075,42 @@ func TestInvalidateListModelsCache_DropsAllEntries(t *testing.T) {
 		t.Fatalf("expected empty listAllModelsCache after InvalidateListModelsCache, got %#v", listAllModelsCache)
 	}
 }
+
+// A completed catalog refresh must not detach a cold-start waiter from the
+// entry its in-flight fill will update. Expire that entry in place; completed
+// entries can still be dropped so the next request cannot serve old models.
+func TestInvalidateListModelsCacheAfterRefresh_PreservesInFlightEntry(t *testing.T) {
+	inFlight := &listAllModelsCacheEntry{
+		resp: &schemas.BifrostListModelsResponse{
+			Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+		},
+		at:   time.Now(),
+		done: make(chan struct{}),
+	}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk-in-flight:omp-gw:false": inFlight,
+		"vk-complete:omp-gw:false": {
+			resp: &schemas.BifrostListModelsResponse{
+				Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+			},
+			at: time.Now(),
+		},
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	InvalidateListModelsCacheAfterRefresh()
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if got := listAllModelsCache["vk-in-flight:omp-gw:false"]; got != inFlight {
+		t.Fatalf("in-flight cache entry was detached: got %p, want %p", got, inFlight)
+	}
+	if !inFlight.at.IsZero() {
+		t.Fatalf("in-flight cache entry timestamp got %v, want zero", inFlight.at)
+	}
+	if _, ok := listAllModelsCache["vk-complete:omp-gw:false"]; ok {
+		t.Fatal("completed stale cache entry was not dropped")
+	}
+}

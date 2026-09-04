@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -302,9 +303,34 @@ func refreshHandlerForTest(mgr *mockModelsManager) *ProviderHandler {
 	}
 }
 
+func primeListModelsCacheForRefreshTest(t *testing.T) {
+	t.Helper()
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk:openai:false": {},
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+}
+
+func requireListModelsCacheSize(t *testing.T, want int) {
+	t.Helper()
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if len(listAllModelsCache) != want {
+		t.Fatalf("list-model cache size got %d, want %d: %#v", len(listAllModelsCache), want, listAllModelsCache)
+	}
+}
+
+func requireListModelsCacheEmpty(t *testing.T) {
+	t.Helper()
+	requireListModelsCacheSize(t, 0)
+}
+
 func TestRefreshProviderModels_DelegatesToModelsManager(t *testing.T) {
 	mgr := &mockModelsManager{}
 	h := refreshHandlerForTest(mgr)
+	primeListModelsCacheForRefreshTest(t)
 
 	ctx := newTestRequestCtx("")
 	ctx.SetUserValue("provider", "openai")
@@ -316,11 +342,13 @@ func TestRefreshProviderModels_DelegatesToModelsManager(t *testing.T) {
 	if len(mgr.refreshProviderCalls) != 1 || mgr.refreshProviderCalls[0] != "openai" {
 		t.Fatalf("expected one provider-level refresh for openai, got %v", mgr.refreshProviderCalls)
 	}
+	requireListModelsCacheEmpty(t)
 }
 
 func TestRefreshProviderKeyModels_DelegatesToModelsManager(t *testing.T) {
 	mgr := &mockModelsManager{}
 	h := refreshHandlerForTest(mgr)
+	primeListModelsCacheForRefreshTest(t)
 
 	ctx := newTestRequestCtx("")
 	ctx.SetUserValue("provider", "openai")
@@ -333,6 +361,7 @@ func TestRefreshProviderKeyModels_DelegatesToModelsManager(t *testing.T) {
 	if len(mgr.refreshKeyCalls) != 1 || mgr.refreshKeyCalls[0].keyID != "key-1" {
 		t.Fatalf("expected one refresh for key-1, got %v", mgr.refreshKeyCalls)
 	}
+	requireListModelsCacheEmpty(t)
 }
 
 // A refresh already running for the provider must surface as 409 rather than
@@ -341,6 +370,7 @@ func TestRefreshProviderKeyModels_DelegatesToModelsManager(t *testing.T) {
 func TestRefreshProviderModels_InFlightReturns409(t *testing.T) {
 	mgr := &mockModelsManager{refreshErr: ErrRefreshInProgress}
 	h := refreshHandlerForTest(mgr)
+	primeListModelsCacheForRefreshTest(t)
 
 	ctx := newTestRequestCtx("")
 	ctx.SetUserValue("provider", "openai")
@@ -349,6 +379,22 @@ func TestRefreshProviderModels_InFlightReturns409(t *testing.T) {
 	if ctx.Response.StatusCode() != fasthttp.StatusConflict {
 		t.Fatalf("status got %d, want 409; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
 	}
+	requireListModelsCacheSize(t, 1)
+}
+
+func TestRefreshProviderModels_FailurePreservesCache(t *testing.T) {
+	mgr := &mockModelsManager{refreshErr: errors.New("upstream unavailable")}
+	h := refreshHandlerForTest(mgr)
+	primeListModelsCacheForRefreshTest(t)
+
+	ctx := newTestRequestCtx("")
+	ctx.SetUserValue("provider", "openai")
+	h.refreshProviderModels(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusInternalServerError {
+		t.Fatalf("status got %d, want 500; body=%s", ctx.Response.StatusCode(), ctx.Response.Body())
+	}
+	requireListModelsCacheSize(t, 1)
 }
 
 func TestRefreshProviderKeyModels_UnknownKeyReturns404(t *testing.T) {
