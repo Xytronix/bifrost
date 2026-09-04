@@ -1988,24 +1988,17 @@ func TestRefreshListModels_ProviderlessKeyCachesEmptyCatalog(t *testing.T) {
 	// cache nil, which listModelsCached reports as an opaque 400
 	// "failed to list models". Record the empty result instead.
 	key := "vk-mcp-only:*:false"
+	entry := &listAllModelsCacheEntry{done: make(chan struct{})}
 	listAllModelsCacheMu.Lock()
-	delete(listAllModelsCache, key)
+	listAllModelsCache[key] = entry
 	listAllModelsCacheMu.Unlock()
-	t.Cleanup(func() {
-		listAllModelsCacheMu.Lock()
-		delete(listAllModelsCache, key)
-		listAllModelsCacheMu.Unlock()
-	})
+	t.Cleanup(InvalidateListModelsCache)
 
 	// The guard runs before the client check, so a nil client is fine here.
 	h := &CompletionHandler{}
-	done := make(chan struct{})
-	h.refreshListModels(key, "vk-mcp-only", []schemas.ModelProvider{}, true, "", false, done)
+	done := entry.done
+	h.refreshListModels("vk-mcp-only", []schemas.ModelProvider{}, true, "", false, entry, entry.generation)
 	<-done
-
-	listAllModelsCacheMu.Lock()
-	entry := listAllModelsCache[key]
-	listAllModelsCacheMu.Unlock()
 
 	if entry == nil || entry.resp == nil {
 		t.Fatalf("provider-less key must cache an empty catalog, got %#v", entry)
@@ -2023,25 +2016,24 @@ func TestRefreshListModels_UnsetProviderListStillFansOut(t *testing.T) {
 	// scopes the request. That must not be mistaken for "granted nothing", or
 	// an unscoped deployment would report an empty catalog.
 	key := "no-vk:*:false"
+	entry := &listAllModelsCacheEntry{done: make(chan struct{})}
 	listAllModelsCacheMu.Lock()
-	delete(listAllModelsCache, key)
+	listAllModelsCache[key] = entry
 	listAllModelsCacheMu.Unlock()
-	t.Cleanup(func() {
-		listAllModelsCacheMu.Lock()
-		delete(listAllModelsCache, key)
-		listAllModelsCacheMu.Unlock()
-	})
+	t.Cleanup(InvalidateListModelsCache)
 
 	h := &CompletionHandler{} // nil client: returns before any fan-out
-	done := make(chan struct{})
-	h.refreshListModels(key, "vk-1", nil, false, "", false, done)
+	done := entry.done
+	h.refreshListModels("vk-1", nil, false, "", false, entry, entry.generation)
 	<-done
 
 	listAllModelsCacheMu.Lock()
-	entry := listAllModelsCache[key]
-	listAllModelsCacheMu.Unlock()
-	if entry != nil && entry.resp != nil {
+	defer listAllModelsCacheMu.Unlock()
+	if entry.resp != nil {
 		t.Fatalf("unscoped request must not be cached as an empty catalog")
+	}
+	if entry.done != nil {
+		t.Fatal("nil-client refresh did not clear the in-flight marker")
 	}
 }
 
@@ -2119,5 +2111,76 @@ func TestMarkListModelsCacheStale_PreservesSnapshotsAndInFlightEntries(t *testin
 		if !entry.at.IsZero() {
 			t.Fatalf("cache entry %q timestamp got %v, want zero", key, entry.at)
 		}
+	}
+}
+
+func TestCompleteListModelsRefresh_DoesNotRevalidateAfterStaleMark(t *testing.T) {
+	oldResp := &schemas.BifrostListModelsResponse{
+		Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+	}
+	entry := &listAllModelsCacheEntry{
+		resp:       oldResp,
+		at:         time.Now(),
+		done:       make(chan struct{}),
+		generation: 7,
+	}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk:omp-gw:false": entry,
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	refreshGeneration := entry.generation
+	MarkListModelsCacheStale()
+	completeListModelsRefresh(entry, refreshGeneration, &schemas.BifrostListModelsResponse{
+		Data: []schemas.Model{{ID: "omp-gw/pre-refresh-model"}},
+	}, nil)
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if entry.resp != oldResp {
+		t.Fatalf("in-flight completion replaced the last-known-good response after a stale mark")
+	}
+	if !entry.at.IsZero() {
+		t.Fatalf("in-flight completion revalidated a stale entry at %v", entry.at)
+	}
+	if entry.generation != refreshGeneration+1 {
+		t.Fatalf("cache generation got %d, want %d", entry.generation, refreshGeneration+1)
+	}
+	if entry.done != nil {
+		t.Fatal("in-flight completion did not clear the refresh marker")
+	}
+}
+
+func TestCompleteListModelsRefresh_PreservesColdWaiterAfterStaleMark(t *testing.T) {
+	entry := &listAllModelsCacheEntry{
+		done:       make(chan struct{}),
+		generation: 3,
+	}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk-cold:omp-gw:false": entry,
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	refreshGeneration := entry.generation
+	MarkListModelsCacheStale()
+	resp := &schemas.BifrostListModelsResponse{
+		Data: []schemas.Model{{ID: "omp-gw/pre-refresh-model"}},
+	}
+	completeListModelsRefresh(entry, refreshGeneration, resp, nil)
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if entry.resp != resp {
+		t.Fatal("cold waiter lost the completed response after a stale mark")
+	}
+	if !entry.at.IsZero() {
+		t.Fatalf("cold response must remain stale for the next request, got %v", entry.at)
+	}
+	if entry.done != nil {
+		t.Fatal("cold completion did not clear the refresh marker")
 	}
 }

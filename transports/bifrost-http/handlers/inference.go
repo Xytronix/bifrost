@@ -1282,9 +1282,10 @@ func pricingFromEntry(e *modelcatalog.PricingEntry) *schemas.Pricing {
 const listAllModelsCacheTTL = 5 * time.Minute
 
 type listAllModelsCacheEntry struct {
-	resp *schemas.BifrostListModelsResponse
-	at   time.Time
-	done chan struct{} // non-nil while a refresh is in flight
+	resp       *schemas.BifrostListModelsResponse
+	at         time.Time
+	done       chan struct{} // non-nil while a refresh is in flight
+	generation uint64        // incremented when a catalog refresh makes this snapshot stale
 }
 
 var (
@@ -1304,15 +1305,16 @@ func InvalidateListModelsCache() {
 }
 
 // MarkListModelsCacheStale expires every cached GET /v1/models snapshot in
-// place after a successful live-catalog refresh. The next request serves the
-// last-known-good response immediately while starting a background refill;
-// in-flight cold-start waiters also retain the entry pointer their fill updates.
+// place after a live-catalog refresh pass. The next request serves the
+// last-known-good response immediately while starting a background refill.
+// A generation change prevents an older in-flight refill from revalidating it.
 func MarkListModelsCacheStale() {
 	listAllModelsCacheMu.Lock()
 	defer listAllModelsCacheMu.Unlock()
 	for _, entry := range listAllModelsCache {
 		if entry != nil {
 			entry.at = time.Time{}
+			entry.generation++
 		}
 	}
 }
@@ -1345,7 +1347,8 @@ func (h *CompletionHandler) listModelsCached(ctx *schemas.BifrostContext, req *s
 	fresh := entry.resp != nil && time.Since(entry.at) < listAllModelsCacheTTL
 	if !fresh && entry.done == nil {
 		entry.done = make(chan struct{})
-		go h.refreshListModels(key, vk, avail, availSet, req.Provider, req.Unfiltered, entry.done)
+		refreshGeneration := entry.generation
+		go h.refreshListModels(vk, avail, availSet, req.Provider, req.Unfiltered, entry, refreshGeneration)
 	}
 	cached := entry.resp
 	done := entry.done
@@ -1387,9 +1390,10 @@ func (h *CompletionHandler) listModelsCached(ctx *schemas.BifrostContext, req *s
 	return page, nil
 }
 
-// refreshListModels performs the (slow) provider fan-out or single-provider fetch on a detached
-// context and stores the full result in the cache under key.
-func (h *CompletionHandler) refreshListModels(key, vk string, avail []schemas.ModelProvider, availSet bool, provider schemas.ModelProvider, unfiltered bool, done chan struct{}) {
+// refreshListModels performs the (slow) provider fan-out or single-provider
+// fetch on a detached context and stores the full result in the cache entry.
+func (h *CompletionHandler) refreshListModels(vk string, avail []schemas.ModelProvider, availSet bool, provider schemas.ModelProvider, unfiltered bool, entry *listAllModelsCacheEntry, refreshGeneration uint64) {
+	done := entry.done
 	defer close(done)
 
 	// A virtual key with no provider grants — an MCP-only key, which exists to
@@ -1403,20 +1407,12 @@ func (h *CompletionHandler) refreshListModels(key, vk string, avail []schemas.Mo
 	// key, so an unset list means no scoping applies and the fan-out must
 	// still run.
 	if availSet && len(avail) == 0 {
-		listAllModelsCacheMu.Lock()
-		defer listAllModelsCacheMu.Unlock()
-		entry := listAllModelsCache[key]
-		if entry == nil {
-			entry = &listAllModelsCacheEntry{}
-			listAllModelsCache[key] = entry
-		}
-		entry.resp = &schemas.BifrostListModelsResponse{Data: []schemas.Model{}}
-		entry.at = time.Now()
-		entry.done = nil
+		completeListModelsRefresh(entry, refreshGeneration, &schemas.BifrostListModelsResponse{Data: []schemas.Model{}}, nil)
 		return
 	}
 
 	if h.client == nil {
+		completeListModelsRefresh(entry, refreshGeneration, nil, nil)
 		return
 	}
 
@@ -1441,16 +1437,23 @@ func (h *CompletionHandler) refreshListModels(key, vk string, avail []schemas.Mo
 		resp, err = h.client.ListModelsRequest(fillCtx, fetchReq)
 	}
 
+	completeListModelsRefresh(entry, refreshGeneration, resp, err)
+}
+
+// completeListModelsRefresh publishes a refill without allowing work started
+// before a catalog refresh to make that entry fresh again. A cold waiter still
+// receives the completed response, but the zero timestamp forces a new refill
+// on the next request.
+func completeListModelsRefresh(entry *listAllModelsCacheEntry, refreshGeneration uint64, resp *schemas.BifrostListModelsResponse, err *schemas.BifrostError) {
 	listAllModelsCacheMu.Lock()
 	defer listAllModelsCacheMu.Unlock()
-	entry := listAllModelsCache[key]
-	if entry == nil {
-		entry = &listAllModelsCacheEntry{}
-		listAllModelsCache[key] = entry
-	}
 	if err == nil && resp != nil {
-		entry.resp = resp
-		entry.at = time.Now()
+		if entry.generation == refreshGeneration || entry.resp == nil {
+			entry.resp = resp
+		}
+		if entry.generation == refreshGeneration {
+			entry.at = time.Now()
+		}
 	}
 	entry.done = nil
 }
