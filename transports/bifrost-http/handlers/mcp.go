@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"slices"
 	"sort"
 	"strconv"
@@ -3309,7 +3310,7 @@ func (h *MCPHandler) completeMCPClientOAuth(ctx *fasthttp.RequestCtx) {
 			if pendingFlow, flowErr := h.store.ConfigStore.GetOauthUserSessionByModeIdentityAndMCPClient(ctx, schemas.MCPAuthModeAdmin, "", dbClient.ClientID); flowErr != nil {
 				logger.Warn(fmt.Sprintf("failed to check for an in-flight reauth flow for MCP client %s: %v", dbClient.ClientID, flowErr))
 			} else if isPrematureOAuthCompletion(pendingFlow, time.Now()) {
-				SendError(ctx, fasthttp.StatusConflict, "Authorization has not completed yet: the browser flow may still be open, or the upstream provider rejected it before redirecting back. Wait for it to finish, or retry reauthorize.")
+				SendError(ctx, http.StatusTooEarly, "Authorization has not completed yet: the browser flow may still be open, or the upstream provider rejected it before redirecting back. Wait for it to finish, or retry reauthorize.")
 				return
 			}
 			reauthClientConfig, err := h.store.ConfigStore.GetMCPClientConfigByID(ctx, dbClient.ClientID)

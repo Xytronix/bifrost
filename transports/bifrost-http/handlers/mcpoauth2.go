@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"time"
 
 	"github.com/fasthttp/router"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
+	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/oauth2"
 	"github.com/maximhq/bifrost/transports/bifrost-http/lib"
 	"github.com/valyala/fasthttp"
@@ -186,27 +188,85 @@ func (h *OAuthHandler) getOAuthConfigStatus(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// expires_at (the flow's own PKCE-attempt deadline) lived on this row
-	// before the flow table split it out onto TableMCPOauthFlow — dropped
-	// from this response rather than joined in: the popup UI that polls this
-	// endpoint (oauth2Authorizer.tsx) only ever branches on status, never
-	// reads a deadline for a live countdown.
-	response := map[string]interface{}{
-		"id":         oauthConfig.ID,
-		"status":     oauthConfig.Status,
-		"created_at": oauthConfig.CreatedAt,
+	status := oauthConfig.Status
+	var flowExpiresAt *time.Time
+	var sharedToken *configstoreTables.TableMCPOauthToken
+	sharedTokenLoaded := false
+
+	mcpClient, err := h.store.ConfigStore.GetMCPClientByOauthConfigID(ctx, configID)
+	if err != nil && !errors.Is(err, configstore.ErrNotFound) {
+		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get MCP client for OAuth config: %v", err))
+		return
+	}
+	if mcpClient != nil {
+		authType := schemas.MCPAuthType(mcpClient.AuthType)
+		var credentialUpdatedAt time.Time
+		hasCredential := false
+
+		if authType == schemas.MCPAuthTypeOauth || authType == schemas.MCPAuthTypePerUserOauth {
+			sharedToken, err = h.store.ConfigStore.GetSharedOauthTokenByConfigID(ctx, configID)
+			sharedTokenLoaded = true
+			if err != nil {
+				SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get shared OAuth token: %v", err))
+				return
+			}
+			if sharedToken != nil {
+				credentialUpdatedAt = sharedToken.UpdatedAt
+				hasCredential = true
+			}
+		}
+		if authType == schemas.MCPAuthTypePerUserOauth {
+			adminToken, tokenErr := h.store.ConfigStore.GetAdminOauthTokenByMCPClientID(ctx, mcpClient.ClientID)
+			if tokenErr != nil {
+				SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get admin OAuth token: %v", tokenErr))
+				return
+			}
+			if adminToken != nil && (!hasCredential || adminToken.UpdatedAt.After(credentialUpdatedAt)) {
+				credentialUpdatedAt = adminToken.UpdatedAt
+				hasCredential = true
+			}
+		}
+
+		flow, flowErr := h.store.ConfigStore.GetOauthUserSessionByModeIdentityAndMCPClient(ctx, schemas.MCPAuthModeAdmin, "", mcpClient.ClientID)
+		if flowErr != nil {
+			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to get OAuth flow status: %v", flowErr))
+			return
+		}
+		if flow != nil {
+			now := time.Now()
+			flowStatus := flow.Status
+			isLiveFlow := flowStatus == "claiming" || (flowStatus == "pending" && now.Before(flow.ExpiresAt))
+			if flowStatus == "pending" && !now.Before(flow.ExpiresAt) {
+				flowStatus = "expired"
+			}
+			if isLiveFlow || !hasCredential || flow.UpdatedAt.After(credentialUpdatedAt) {
+				status = flowStatus
+				flowExpiresAt = &flow.ExpiresAt
+			}
+		}
 	}
 
-	if oauthConfig.Status == "authorized" {
+	response := map[string]interface{}{
+		"id":         oauthConfig.ID,
+		"status":     status,
+		"created_at": oauthConfig.CreatedAt,
+	}
+	if flowExpiresAt != nil {
+		response["expires_at"] = flowExpiresAt
+	}
+
+	if status == "authorized" {
 		// Resolve the shared token row via (oauth_config_id, auth_mode='shared')
 		// — the replacement for the retired TableOauthConfig.TokenID FK shortcut.
-		token, err := h.store.ConfigStore.GetSharedOauthTokenByConfigID(ctx, configID)
-		if err == nil && token != nil {
-			response["token_id"] = token.ID
-			if token.ExpiresAt != nil {
-				response["token_expires_at"] = token.ExpiresAt
+		if !sharedTokenLoaded {
+			sharedToken, _ = h.store.ConfigStore.GetSharedOauthTokenByConfigID(ctx, configID)
+		}
+		if sharedToken != nil {
+			response["token_id"] = sharedToken.ID
+			if sharedToken.ExpiresAt != nil {
+				response["token_expires_at"] = sharedToken.ExpiresAt
 			}
-			response["token_scopes"] = token.Scopes
+			response["token_scopes"] = sharedToken.Scopes
 		}
 	}
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/client"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -203,6 +204,42 @@ func TestPerformCheck_NilConn_SharedAuthType_TriggersReconnect(t *testing.T) {
 		_, inFlightOrDone := manager.reconnectingClients.Load(config.ID)
 		return inFlightOrDone
 	}, 2*time.Second, 10*time.Millisecond, "performCheck must trigger a reconnect attempt for a sticky client with no live connection")
+}
+
+func TestPerformCheck_LiveConnectionFailure_TriggersReconnect(t *testing.T) {
+	manager := NewMCPManager(context.Background(), schemas.MCPConfig{}, nil, &MockLogger{}, nil)
+	config := &schemas.MCPClientConfig{
+		ID:                     "client-live-reconnect-trigger",
+		Name:                   "live-shared-client",
+		AuthType:               schemas.MCPAuthTypeNone,
+		ConnectionType:         schemas.MCPConnectionTypeHTTP,
+		ConnectionString:       schemas.NewSecretVar("http://127.0.0.1:0/mcp"),
+		NeedsSessionStickiness: schemas.Ptr(true),
+	}
+	conn := client.NewClient(
+		&fakeCallToolTransport{nonCallErr: errors.New("422 Unexpected message, expect initialize request")},
+		client.WithSession(),
+	)
+	manager.mu.Lock()
+	manager.clientMap[config.ID] = &schemas.MCPClientState{
+		Name:            config.Name,
+		ExecutionConfig: config,
+		State:           schemas.MCPConnectionStateHealthy,
+		Conn:            conn,
+	}
+	manager.mu.Unlock()
+
+	checker := NewClientConnectionChecker(manager, config.ID, time.Minute, false, &MockLogger{})
+	checker.performCheck()
+
+	manager.mu.RLock()
+	state := manager.clientMap[config.ID].State
+	manager.mu.RUnlock()
+	require.Equal(t, schemas.MCPConnectionStateUnstable, state)
+	require.Eventually(t, func() bool {
+		_, reconnectRegistered := manager.reconnectingClients.Load(config.ID)
+		return reconnectRegistered
+	}, 2*time.Second, 10*time.Millisecond, "a failed live connection check must trigger a background reconnect")
 }
 
 // TestPerformCheck_NilConn_PerUserOAuth_SuccessUpdatesToolMap is an

@@ -99,6 +99,7 @@ type fakeCallToolTransport struct {
 	mu                sync.Mutex
 	callCount         int
 	callErrs          []error
+	nonCallErr        error
 	callResultIsError []bool
 }
 
@@ -106,6 +107,9 @@ func (f *fakeCallToolTransport) Start(_ context.Context) error { return nil }
 
 func (f *fakeCallToolTransport) SendRequest(_ context.Context, request transport.JSONRPCRequest) (*transport.JSONRPCResponse, error) {
 	if request.Method != "tools/call" {
+		if f.nonCallErr != nil {
+			return nil, f.nonCallErr
+		}
 		return &transport.JSONRPCResponse{JSONRPC: "2.0", ID: request.ID, Result: json.RawMessage(`{}`)}, nil
 	}
 

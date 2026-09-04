@@ -318,6 +318,7 @@ func (c *ClientConnectionChecker) checkLiveConnection(conn *client.Client, clien
 		}, ProbeRetryConfig, c.logger)
 		if pingErr != nil {
 			c.recordFailure(clientName, "ping", pingErr, connGeneration)
+			c.reconnectLiveConnection(clientName, connGeneration)
 			return false
 		}
 	}
@@ -333,12 +334,38 @@ func (c *ClientConnectionChecker) checkLiveConnection(conn *client.Client, clien
 	}, ProbeRetryConfig, c.logger)
 	if listErr != nil {
 		c.recordFailure(clientName, "list_tools", listErr, connGeneration)
+		c.reconnectLiveConnection(clientName, connGeneration)
 		return false
 	}
 
 	c.writeBackTools(connGeneration, newTools, newMapping)
 	c.recordSuccess(clientName, connGeneration)
 	return true
+}
+
+// reconnectLiveConnection starts the manager's make-before-break reconnect
+// only if the connection that failed is still current. ReconnectClient
+// deduplicates concurrent attempts; the generation check also prevents a
+// late failure from reconnecting a newer connection that already replaced it.
+func (c *ClientConnectionChecker) reconnectLiveConnection(clientName string, connGeneration uint64) {
+	c.manager.mu.RLock()
+	clientState, exists := c.manager.clientMap[c.clientID]
+	isCurrent := exists &&
+		clientState != nil &&
+		clientState.Conn != nil &&
+		clientState.ConnGeneration == connGeneration &&
+		clientState.State != schemas.MCPConnectionStateDisabled &&
+		clientState.State != schemas.MCPConnectionStateNeedsReauth
+	c.manager.mu.RUnlock()
+	if !isCurrent {
+		return
+	}
+
+	go func() {
+		if err := c.manager.ReconnectClient(c.clientID); err != nil {
+			c.logger.Debug("%s Connection checker's reconnect attempt for %s did not complete: %v", MCPLogPrefix, clientName, err)
+		}
+	}()
 }
 
 // checkPerCall runs the per-call/ephemeral discovery cycle for auth types

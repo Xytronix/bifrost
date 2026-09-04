@@ -283,9 +283,16 @@ func TestGetOauthUserSessionByModeIdentityAndMCPClient_AdminMode(t *testing.T) {
 
 	uid := "user-1"
 	vkID := "vk-1"
+	now := time.Now()
+	adminFlowOld := &tables.TableMCPOauthFlow{
+		ID: "aaa-admin-old", MCPClientID: "mcp-1", OauthConfigID: "cfg-1",
+		FlowMode: "admin", Status: "failed", ExpiresAt: now.Add(time.Hour),
+		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+	}
 	adminFlow1 := &tables.TableMCPOauthFlow{
-		ID: "flow-admin-1", MCPClientID: "mcp-1", OauthConfigID: "cfg-1",
-		FlowMode: "admin", Status: "pending", ExpiresAt: time.Now().Add(time.Hour),
+		ID: "zzz-admin-current", MCPClientID: "mcp-1", OauthConfigID: "cfg-1",
+		FlowMode: "admin", Status: "pending", ExpiresAt: now.Add(time.Hour),
+		CreatedAt: now, UpdatedAt: now,
 	}
 	adminFlow2 := &tables.TableMCPOauthFlow{
 		ID: "flow-admin-2", MCPClientID: "mcp-2", OauthConfigID: "cfg-1",
@@ -303,6 +310,7 @@ func TestGetOauthUserSessionByModeIdentityAndMCPClient_AdminMode(t *testing.T) {
 		ID: "flow-session-1", MCPClientID: "mcp-1", OauthConfigID: "cfg-1",
 		FlowMode: "session", Status: "pending", SessionID: "sess-tok-1", ExpiresAt: time.Now().Add(time.Hour),
 	}
+	require.NoError(t, store.DB().WithContext(ctx).Create(adminFlowOld).Error)
 	require.NoError(t, store.DB().WithContext(ctx).Create(adminFlow1).Error)
 	require.NoError(t, store.DB().WithContext(ctx).Create(adminFlow2).Error)
 	require.NoError(t, store.DB().WithContext(ctx).Create(userFlow).Error)
@@ -313,7 +321,7 @@ func TestGetOauthUserSessionByModeIdentityAndMCPClient_AdminMode(t *testing.T) {
 	got, err := store.GetOauthUserSessionByModeIdentityAndMCPClient(ctx, schemas.MCPAuthModeAdmin, "", "mcp-1")
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	require.Equal(t, "flow-admin-1", got.ID)
+	require.Equal(t, "zzz-admin-current", got.ID, "the canonical lookup must return the most recently updated flow")
 
 	// A different mcp_client_id's admin row is a distinct binding — resolves
 	// to its own row, not mcp-1's.

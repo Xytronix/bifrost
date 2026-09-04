@@ -41,11 +41,39 @@ type mockOAuth2Store struct {
 	authReqs   map[string]*configtables.TableOAuth2AuthorizeRequest
 	clients    map[string]*configtables.TableOAuth2Client
 
-	sessionRows []configstore.OAuth2SessionRow
-	sessionByID map[string]*configtables.TableOAuth2RefreshToken
-	listErr     error
-	revokeErr   error
-	revokedIDs  []string
+	sessionRows             []configstore.OAuth2SessionRow
+	sessionByID             map[string]*configtables.TableOAuth2RefreshToken
+	listErr                 error
+	revokeErr               error
+	revokedIDs              []string
+	oauthConfigs            map[string]*configtables.TableOauthConfig
+	mcpClientsByOauthConfig map[string]*configtables.TableMCPClient
+	adminFlowsByClient      map[string]*configtables.TableMCPOauthFlow
+	sharedTokensByConfig    map[string]*configtables.TableMCPOauthToken
+	adminTokensByClient     map[string]*configtables.TableMCPOauthToken
+}
+
+func (m *mockOAuth2Store) GetOauthConfigByID(_ context.Context, id string) (*configtables.TableOauthConfig, error) {
+	return m.oauthConfigs[id], nil
+}
+
+func (m *mockOAuth2Store) GetMCPClientByOauthConfigID(_ context.Context, oauthConfigID string) (*configtables.TableMCPClient, error) {
+	return m.mcpClientsByOauthConfig[oauthConfigID], nil
+}
+
+func (m *mockOAuth2Store) GetOauthUserSessionByModeIdentityAndMCPClient(_ context.Context, mode schemas.MCPAuthMode, _ string, mcpClientID string) (*configtables.TableMCPOauthFlow, error) {
+	if mode != schemas.MCPAuthModeAdmin {
+		return nil, nil
+	}
+	return m.adminFlowsByClient[mcpClientID], nil
+}
+
+func (m *mockOAuth2Store) GetSharedOauthTokenByConfigID(_ context.Context, oauthConfigID string) (*configtables.TableMCPOauthToken, error) {
+	return m.sharedTokensByConfig[oauthConfigID], nil
+}
+
+func (m *mockOAuth2Store) GetAdminOauthTokenByMCPClientID(_ context.Context, mcpClientID string) (*configtables.TableMCPOauthToken, error) {
+	return m.adminTokensByClient[mcpClientID], nil
 }
 
 func (m *mockOAuth2Store) GetOAuth2AuthorizeRequestByID(_ context.Context, id string) (*configtables.TableOAuth2AuthorizeRequest, error) {

@@ -7246,7 +7246,7 @@ func (s *RDBConfigStore) GetOauthUserSessionByModeIdentityAndMCPClient(ctx conte
 		return nil, fmt.Errorf("unknown auth mode: %s", mode)
 	}
 	var flow tables.TableMCPOauthFlow
-	if err := q.First(&flow).Error; err != nil {
+	if err := q.Order("updated_at DESC").Order("id DESC").First(&flow).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
