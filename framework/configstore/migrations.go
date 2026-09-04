@@ -475,6 +475,7 @@ var configstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"add_ultrafast_pricing_columns"}, run: migrationAddUltrafastPricingColumns},
 	{IDs: []string{"add_image_size_quality_pricing_columns"}, run: migrationAddImageSizeQualityPricingColumns},
 	{IDs: []string{"add_batch_jobs_attribution_columns"}, run: migrationAddBatchJobsAttributionColumns},
+	{IDs: []string{"add_models_dev_url_column"}, run: migrationAddModelsDevURLColumn},
 }
 
 // migrationAddBatchJobsAttributionColumns adds the requester-identity columns to
@@ -12253,6 +12254,30 @@ func migrationAddImageSizeQualityPricingColumns(ctx context.Context, db *gorm.DB
 	}})
 	if err := m.Migrate(); err != nil {
 		return fmt.Errorf("error running %s migration: %s", migrationName, err.Error())
+	}
+	return nil
+}
+
+func migrationAddModelsDevURLColumn(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	const migrationName = "add_models_dev_url_column"
+	logger.Info("[configstore] starting migration %s", migrationName)
+	defer logger.Info("[configstore] finished migration %s", migrationName)
+
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			if err := addColumnIfNotExists(tx, logger, &tables.TableFrameworkConfig{}, "ModelsDevURL"); err != nil {
+				return fmt.Errorf("failed to add models_dev_url column to framework_configs: %w", err)
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			return dropColumnIfExists(tx.WithContext(ctx), logger, &tables.TableFrameworkConfig{}, "models_dev_url")
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running %s migration: %w", migrationName, err)
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -610,6 +611,284 @@ func TestEnrichListModelsResponse_MarksDeprecatedPricingRows(t *testing.T) {
 	}
 	if !byID["openai/provider-deprecated"].IsDeprecated {
 		t.Fatalf("provider-deprecated flag should be preserved: %#v", byID["openai/provider-deprecated"])
+	}
+}
+
+func TestEnrichListModelsResponse_ProviderAgnosticContextAndPricingFallback(t *testing.T) {
+	// "Custom Router" is a registered custom/aggregator provider (so the "/"
+	// prefix is stripped to the base model name) that is deliberately absent
+	// from the pricing catalog, exercising the provider-agnostic fallback for
+	// both capability metadata and base-model pricing.
+	schemas.RegisterKnownProvider("Custom Router")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("Custom Router") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"gpt-4o": {"provider":"openai","mode":"chat","base_model":"gpt-4o","max_input_tokens":128000,"max_output_tokens":16384,"input_cost_per_token":0.0000025}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "Custom Router/gpt-4o"},
+		{ID: "openai/gpt-4o"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+
+	custom := byID["Custom Router/gpt-4o"]
+	if custom.ContextLength == nil || *custom.ContextLength != 128000 {
+		t.Fatalf("custom model should borrow context length 128000 via base-model fallback, got %#v", custom.ContextLength)
+	}
+	if custom.MaxOutputTokens == nil || *custom.MaxOutputTokens != 16384 {
+		t.Fatalf("custom model should borrow max output tokens 16384 via base-model fallback, got %#v", custom.MaxOutputTokens)
+	}
+	if custom.Pricing == nil || custom.Pricing.Prompt == nil {
+		t.Fatalf("custom model should borrow base-model pricing via fallback, got %#v", custom.Pricing)
+	}
+	if *custom.Pricing.Prompt != "0.0000025000" {
+		t.Fatalf("custom model prompt price should match base gpt-4o (0.0000025000), got %q", *custom.Pricing.Prompt)
+	}
+
+	native := byID["openai/gpt-4o"]
+	if native.ContextLength == nil || *native.ContextLength != 128000 {
+		t.Fatalf("native model should have context length 128000 from provider match, got %#v", native.ContextLength)
+	}
+	if native.Pricing == nil {
+		t.Fatalf("native provider-matched model should have pricing enriched, got nil")
+	}
+}
+
+func TestEnrichListModelsResponse_StripsEffortMarkerForFallbackPricing(t *testing.T) {
+	// A custom/aggregator provider serving an effort-suffixed alias
+	// ("claude-fable-5-low") resolves to the base model's context AND pricing by
+	// stripping the identity-preserving marker — dynamically, no per-model override.
+	schemas.RegisterKnownProvider("Opera")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("Opera") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"claude-fable-5": {"provider":"anthropic","mode":"chat","base_model":"claude-fable-5","max_input_tokens":200000,"max_output_tokens":64000,"input_cost_per_token":0.00001,"output_cost_per_token":0.00005}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "Opera/claude-fable-5-low"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	m := resp.Data[0]
+	if m.ContextLength == nil || *m.ContextLength != 200000 {
+		t.Fatalf("effort alias should borrow context 200000 via marker-stripped base, got %#v", m.ContextLength)
+	}
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("effort alias should borrow base-model pricing, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000100000" {
+		t.Fatalf("prompt price should match claude-fable-5 (0.0000100000), got %q", *m.Pricing.Prompt)
+	}
+}
+
+func TestEnrichListModelsResponse_StripsInnerOrgPrefixForFallbackPricing(t *testing.T) {
+	// An NVIDIA-style provider/org/model id resolves to the aggregated base
+	// entry by dropping the inner org prefix
+	// ("meta/llama-3.1-70b-instruct" -> "llama-3.1-70b-instruct"). Dynamic.
+	schemas.RegisterKnownProvider("NVIDIA")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("NVIDIA") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"llama-3.1-70b-instruct": {"provider":"deepinfra","mode":"chat","base_model":"llama-3.1-70b-instruct","max_input_tokens":131072,"input_cost_per_token":0.0000004,"output_cost_per_token":0.0000004}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "NVIDIA/meta/llama-3.1-70b-instruct"},
+	}}
+	enrichListModelsResponse(resp, catalog)
+	m := resp.Data[0]
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("inner-org model should borrow base-model pricing via last-segment fallback, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000004000" {
+		t.Fatalf("prompt price should match llama-3.1-70b-instruct (0.0000004000), got %q", *m.Pricing.Prompt)
+	}
+}
+func TestEnrichListModelsResponse_SwapsClaudeVersionFamilyForFallbackPricing(t *testing.T) {
+	// Cursor and Warp spell Claude version-first ("claude-4.5-sonnet",
+	// "claude-4-6-opus"); the datasheet spells it family-first
+	// ("claude-sonnet-4-5"), so the two never matched and the alias stayed
+	// unpriced. Resolution rewrites the spelling — dynamic, no per-model map.
+	schemas.RegisterKnownProvider("omp-gw")
+	schemas.RegisterKnownProvider("warp")
+	t.Cleanup(func() {
+		schemas.UnregisterKnownProvider("omp-gw")
+		schemas.UnregisterKnownProvider("warp")
+	})
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"claude-sonnet-4-5": {"provider":"anthropic","mode":"chat","base_model":"claude-sonnet-4-5","max_input_tokens":200000,"input_cost_per_token":0.000003,"output_cost_per_token":0.000015},
+		"claude-opus-4-6": {"provider":"anthropic","mode":"chat","base_model":"claude-opus-4-6","max_input_tokens":200000,"input_cost_per_token":0.000005,"output_cost_per_token":0.000025}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/cursor/claude-4.5-sonnet"},
+		{ID: "warp/claude-4-6-opus-high"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+	dotted := byID["omp-gw/cursor/claude-4.5-sonnet"]
+	if dotted.Pricing == nil || dotted.Pricing.Prompt == nil {
+		t.Fatalf("version-first alias should borrow claude-sonnet-4-5 pricing, got %#v", dotted.Pricing)
+	}
+	if *dotted.Pricing.Prompt != "0.0000030000" {
+		t.Fatalf("prompt price should match claude-sonnet-4-5, got %q", *dotted.Pricing.Prompt)
+	}
+	// Effort marker and version swap must compose.
+	dashed := byID["warp/claude-4-6-opus-high"]
+	if dashed.Pricing == nil || dashed.Pricing.Prompt == nil {
+		t.Fatalf("marker+swap alias should borrow claude-opus-4-6 pricing, got %#v", dashed.Pricing)
+	}
+	if *dashed.Pricing.Prompt != "0.0000050000" {
+		t.Fatalf("prompt price should match claude-opus-4-6, got %q", *dashed.Pricing.Prompt)
+	}
+}
+
+func TestEnrichListModelsResponse_StripsResellerNamePrefixForFallbackPricing(t *testing.T) {
+	// Cursor republishes third-party models under its own name
+	// ("cursor/cursor-grok-4.5-high"); dropping the repeated provider prefix
+	// and the effort marker resolves it to the base model.
+	schemas.RegisterKnownProvider("omp-gw")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("omp-gw") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"grok-4.5": {"provider":"xai","mode":"chat","base_model":"grok-4.5","max_input_tokens":256000,"input_cost_per_token":0.000002,"output_cost_per_token":0.000006}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/cursor/cursor-grok-4.5-high"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	m := resp.Data[0]
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("reseller-prefixed alias should borrow grok-4.5 pricing, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000020000" {
+		t.Fatalf("prompt price should match grok-4.5 (0.0000020000), got %q", *m.Pricing.Prompt)
+	}
+}
+
+func TestModelResolutionCandidates_LeavesDistinctModelsAlone(t *testing.T) {
+	// The rewrites must not collapse genuinely distinct models. A name that is
+	// not version-first Claude yields no swap, and a model whose prefix merely
+	// resembles its provider keeps its own identity in the candidate list.
+	if got := swapClaudeVersionFamily("claude-sonnet-4-5"); got != "" {
+		t.Fatalf("family-first spelling must not be swapped, got %q", got)
+	}
+	if got := swapClaudeVersionFamily("claude-fable-5"); got != "" {
+		t.Fatalf("named (non-family) Claude must not be swapped, got %q", got)
+	}
+	if got := stripProviderNamePrefix("openai/gpt-4o"); got != "" {
+		t.Fatalf("model without a repeated provider prefix must not be stripped, got %q", got)
+	}
+	cands := modelResolutionCandidates("omp-gw/cursor/gpt-5.6-luna-max-fast")
+	if !slices.Contains(cands, "gpt-5.6-luna") {
+		t.Fatalf("stacked serving markers should reduce to the base model, got %v", cands)
+	}
+	if slices.Contains(cands, "gpt-5.6") {
+		t.Fatalf("distinct named variant must not collapse to gpt-5.6, got %v", cands)
+	}
+}
+func TestEnrichListModelsResponse_VendorQualifiesSubscriptionModelForPricing(t *testing.T) {
+	// A subscription reseller serves a model under its short in-house id
+	// ("kimi-code/k3") while the catalog lists the vendor-qualified name
+	// ("kimi-k3"). Those seats are billed at the normal rate elsewhere, so the
+	// qualified entry is the right price to borrow rather than leaving the
+	// model unpriced.
+	schemas.RegisterKnownProvider("omp-gw")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("omp-gw") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"kimi-k3": {"provider":"moonshot","mode":"chat","base_model":"kimi-k3","max_input_tokens":1000000,"input_cost_per_token":0.000003,"output_cost_per_token":0.000015}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/kimi-code/k3"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	m := resp.Data[0]
+	if m.Pricing == nil || m.Pricing.Prompt == nil {
+		t.Fatalf("subscription alias should borrow kimi-k3 pricing, got %#v", m.Pricing)
+	}
+	if *m.Pricing.Prompt != "0.0000030000" {
+		t.Fatalf("prompt price should match kimi-k3 (0.0000030000), got %q", *m.Pricing.Prompt)
+	}
+}
+
+func TestVendorQualifiedNames(t *testing.T) {
+	got := vendorQualifiedNames("omp-gw/kimi-code/k3")
+	for _, want := range []string{"kimi-code-k3", "kimi-k3"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("expected %q among vendor-qualified forms, got %v", want, got)
+		}
+	}
+	// Already vendor-qualified: the strip direction handles it, so adding the
+	// prefix again would only produce "cursor-cursor-...".
+	if got := vendorQualifiedNames("omp-gw/cursor/cursor-grok-4.5"); slices.Contains(got, "cursor-cursor-grok-4.5") {
+		t.Fatalf("must not double-qualify an already-prefixed model, got %v", got)
+	}
+	if got := vendorQualifiedNames("gpt-4o"); len(got) != 0 {
+		t.Fatalf("unqualified id has no owning provider segment, got %v", got)
+	}
+}
+
+func TestEnrichListModelsResponse_DerivesVisionInputModalities(t *testing.T) {
+	// The datasheet advertises vision via supports_vision (no architecture
+	// block). Enrichment must surface it as architecture.input_modalities so
+	// downstream consumers (omp /switch) can flag image capability — for both a
+	// native provider match and a custom/aggregator base-name fallback, while
+	// text-only rows stay unset.
+	schemas.RegisterKnownProvider("Custom Router")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("Custom Router") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"gpt-4o": {"provider":"openai","mode":"chat","base_model":"gpt-4o","max_input_tokens":128000,"input_cost_per_token":0.0000025,"supports_vision":true},
+		"text-only-model": {"provider":"openai","mode":"chat","base_model":"text-only-model","max_input_tokens":32000,"input_cost_per_token":0.000001}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "openai/gpt-4o"},
+		{ID: "Custom Router/gpt-4o"},
+		{ID: "openai/text-only-model"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+	hasImage := func(m schemas.Model) bool {
+		if m.Architecture == nil {
+			return false
+		}
+		for _, mod := range m.Architecture.InputModalities {
+			if mod == "image" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasImage(byID["openai/gpt-4o"]) {
+		t.Fatalf("native vision model should expose image input modality, got %#v", byID["openai/gpt-4o"].Architecture)
+	}
+	if !hasImage(byID["Custom Router/gpt-4o"]) {
+		t.Fatalf("custom vision model should borrow image input modality via base-name fallback, got %#v", byID["Custom Router/gpt-4o"].Architecture)
+	}
+	if hasImage(byID["openai/text-only-model"]) {
+		t.Fatalf("text-only model must not advertise image input, got %#v", byID["openai/text-only-model"].Architecture)
 	}
 }
 
@@ -1782,5 +2061,246 @@ func TestListModels_KeyBlacklistIsCaseInsensitive(t *testing.T) {
 		if strings.EqualFold(m.Name, "gpt-3.5-turbo") {
 			t.Fatalf("gpt-3.5-turbo should be blocked by blacklist, got %v", resp.Models)
 		}
+	}
+}
+
+func TestFallbackEntryForModel_PrefersPricedOverMetadataOnly(t *testing.T) {
+	// The catalog can know a model's context window without knowing its rate
+	// (models.dev publishes plenty, and a seat-included model has none). The
+	// walk must not stop on that row and pin the model to $0 — it has to keep
+	// going to the vendor-qualified candidate that does carry a rate, while
+	// still using the metadata-only row when nothing priced exists.
+	schemas.RegisterKnownProvider("omp-gw")
+	t.Cleanup(func() { schemas.UnregisterKnownProvider("omp-gw") })
+
+	catalog := modelCatalogForPricingJSON(t, []byte(`{
+		"k3": {"provider":"kimi","mode":"chat","base_model":"k3","max_input_tokens":1048576},
+		"kimi-k3": {"provider":"moonshot","mode":"chat","base_model":"kimi-k3","max_input_tokens":1048576,"input_cost_per_token":0.000003,"output_cost_per_token":0.000015},
+		"orphan-model": {"provider":"someone","mode":"chat","base_model":"orphan-model","max_input_tokens":32000}
+	}`))
+	resp := &schemas.BifrostListModelsResponse{Data: []schemas.Model{
+		{ID: "omp-gw/kimi-code/k3"},
+		{ID: "omp-gw/kimi-code/orphan-model"},
+	}}
+
+	enrichListModelsResponse(resp, catalog)
+
+	byID := map[string]schemas.Model{}
+	for _, m := range resp.Data {
+		byID[m.ID] = m
+	}
+	k3 := byID["omp-gw/kimi-code/k3"]
+	if k3.Pricing == nil || k3.Pricing.Prompt == nil {
+		t.Fatalf("must walk past the unpriced k3 row to kimi-k3, got %#v", k3.Pricing)
+	}
+	if *k3.Pricing.Prompt != "0.0000030000" {
+		t.Fatalf("prompt price should match kimi-k3, got %q", *k3.Pricing.Prompt)
+	}
+	orphan := byID["omp-gw/kimi-code/orphan-model"]
+	if orphan.ContextLength == nil || *orphan.ContextLength != 32000 {
+		t.Fatalf("metadata-only row must still enrich context, got %#v", orphan.ContextLength)
+	}
+}
+
+func TestRefreshListModels_ProviderlessKeyCachesEmptyCatalog(t *testing.T) {
+	// An MCP-only virtual key grants tool access and zero providers. Its model
+	// catalog is legitimately empty, but the fan-out errors and leaves the
+	// cache nil, which listModelsCached reports as an opaque 400
+	// "failed to list models". Record the empty result instead.
+	key := "vk-mcp-only:*:false"
+	entry := &listAllModelsCacheEntry{done: make(chan struct{})}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache[key] = entry
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	// The guard runs before the client check, so a nil client is fine here.
+	h := &CompletionHandler{}
+	done := entry.done
+	h.refreshListModels("vk-mcp-only", []schemas.ModelProvider{}, true, "", false, entry, entry.generation)
+	<-done
+
+	if entry == nil || entry.resp == nil {
+		t.Fatalf("provider-less key must cache an empty catalog, got %#v", entry)
+	}
+	if len(entry.resp.Data) != 0 {
+		t.Fatalf("expected an empty model list, got %d", len(entry.resp.Data))
+	}
+	if entry.done != nil {
+		t.Fatalf("refresh must clear the in-flight marker")
+	}
+}
+
+func TestRefreshListModels_UnsetProviderListStillFansOut(t *testing.T) {
+	// The filter leaves the provider list unset when no live virtual key
+	// scopes the request. That must not be mistaken for "granted nothing", or
+	// an unscoped deployment would report an empty catalog.
+	key := "no-vk:*:false"
+	entry := &listAllModelsCacheEntry{done: make(chan struct{})}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache[key] = entry
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	h := &CompletionHandler{} // nil client: returns before any fan-out
+	done := entry.done
+	h.refreshListModels("vk-1", nil, false, "", false, entry, entry.generation)
+	<-done
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if entry.resp != nil {
+		t.Fatalf("unscoped request must not be cached as an empty catalog")
+	}
+	if entry.done != nil {
+		t.Fatal("nil-client refresh did not clear the in-flight marker")
+	}
+}
+
+// TestInvalidateListModelsCache_DropsAllEntries ensures a provider/key reload
+// can force the next GET /v1/models to re-fan-out instead of serving a still-
+// fresh 5-minute TTL entry that was populated before the upstream catalog
+// changed. Without this, PUT /api/providers/{name} re-discovers live models
+// but the public list endpoint keeps reporting the pre-reload snapshot.
+func TestInvalidateListModelsCache_DropsAllEntries(t *testing.T) {
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk-1:omp-gw:false": {
+			resp: &schemas.BifrostListModelsResponse{
+				Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+			},
+			at: time.Now(),
+		},
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(func() {
+		listAllModelsCacheMu.Lock()
+		listAllModelsCache = map[string]*listAllModelsCacheEntry{}
+		listAllModelsCacheMu.Unlock()
+	})
+
+	InvalidateListModelsCache()
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if len(listAllModelsCache) != 0 {
+		t.Fatalf("expected empty listAllModelsCache after InvalidateListModelsCache, got %#v", listAllModelsCache)
+	}
+}
+
+// Refresh completion must expire snapshots in place: the next request serves
+// the last-known-good response immediately while refreshing it in the
+// background, and an existing cold-start waiter keeps the pointer its fill
+// updates.
+func TestMarkListModelsCacheStale_PreservesSnapshotsAndInFlightEntries(t *testing.T) {
+	inFlight := &listAllModelsCacheEntry{
+		resp: &schemas.BifrostListModelsResponse{
+			Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+		},
+		at:   time.Now(),
+		done: make(chan struct{}),
+	}
+	complete := &listAllModelsCacheEntry{
+		resp: &schemas.BifrostListModelsResponse{
+			Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+		},
+		at: time.Now(),
+	}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk-in-flight:omp-gw:false": inFlight,
+		"vk-complete:omp-gw:false":  complete,
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	MarkListModelsCacheStale()
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if got := listAllModelsCache["vk-in-flight:omp-gw:false"]; got != inFlight {
+		t.Fatalf("in-flight cache entry was detached: got %p, want %p", got, inFlight)
+	}
+	if got := listAllModelsCache["vk-complete:omp-gw:false"]; got != complete {
+		t.Fatalf("completed cache entry was detached: got %p, want %p", got, complete)
+	}
+	for key, entry := range listAllModelsCache {
+		if entry.resp == nil {
+			t.Fatalf("cached response %q was discarded", key)
+		}
+		if !entry.at.IsZero() {
+			t.Fatalf("cache entry %q timestamp got %v, want zero", key, entry.at)
+		}
+	}
+}
+
+func TestCompleteListModelsRefresh_DoesNotRevalidateAfterStaleMark(t *testing.T) {
+	oldResp := &schemas.BifrostListModelsResponse{
+		Data: []schemas.Model{{ID: "omp-gw/old-model"}},
+	}
+	entry := &listAllModelsCacheEntry{
+		resp:       oldResp,
+		at:         time.Now(),
+		done:       make(chan struct{}),
+		generation: 7,
+	}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk:omp-gw:false": entry,
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	refreshGeneration := entry.generation
+	MarkListModelsCacheStale()
+	completeListModelsRefresh(entry, refreshGeneration, &schemas.BifrostListModelsResponse{
+		Data: []schemas.Model{{ID: "omp-gw/pre-refresh-model"}},
+	}, nil)
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if entry.resp != oldResp {
+		t.Fatalf("in-flight completion replaced the last-known-good response after a stale mark")
+	}
+	if !entry.at.IsZero() {
+		t.Fatalf("in-flight completion revalidated a stale entry at %v", entry.at)
+	}
+	if entry.generation != refreshGeneration+1 {
+		t.Fatalf("cache generation got %d, want %d", entry.generation, refreshGeneration+1)
+	}
+	if entry.done != nil {
+		t.Fatal("in-flight completion did not clear the refresh marker")
+	}
+}
+
+func TestCompleteListModelsRefresh_PreservesColdWaiterAfterStaleMark(t *testing.T) {
+	entry := &listAllModelsCacheEntry{
+		done:       make(chan struct{}),
+		generation: 3,
+	}
+	listAllModelsCacheMu.Lock()
+	listAllModelsCache = map[string]*listAllModelsCacheEntry{
+		"vk-cold:omp-gw:false": entry,
+	}
+	listAllModelsCacheMu.Unlock()
+	t.Cleanup(InvalidateListModelsCache)
+
+	refreshGeneration := entry.generation
+	MarkListModelsCacheStale()
+	resp := &schemas.BifrostListModelsResponse{
+		Data: []schemas.Model{{ID: "omp-gw/pre-refresh-model"}},
+	}
+	completeListModelsRefresh(entry, refreshGeneration, resp, nil)
+
+	listAllModelsCacheMu.Lock()
+	defer listAllModelsCacheMu.Unlock()
+	if entry.resp != resp {
+		t.Fatal("cold waiter lost the completed response after a stale mark")
+	}
+	if !entry.at.IsZero() {
+		t.Fatalf("cold response must remain stale for the next request, got %v", entry.at)
+	}
+	if entry.done != nil {
+		t.Fatal("cold completion did not clear the refresh marker")
 	}
 }

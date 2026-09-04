@@ -23,6 +23,8 @@ var (
 	CodexCLI = UserAgentIdentifiers{"codex-cli", "codex-tui"}
 	// CodexDesktop identifies requests from the Codex desktop app.
 	CodexDesktop = UserAgentIdentifiers{"codex-desktop", "codex desktop/", "codex/"}
+	// OmpCLI identifies requests from omp / oh-my-pi / pi-coding-agent clients.
+	OmpCLI = UserAgentIdentifiers{"omp/", "oh-my-pi", "pi-coding-agent"}
 	// Cursor identifies requests from Cursor clients.
 	Cursor = UserAgentIdentifiers{"cursor"}
 	// KiloCode identifies requests from Kilo Code clients.
@@ -123,6 +125,7 @@ var UserAgentAppMatchers = []UserAgentAppMatcher{
 	{App: "API", Identifiers: APIClient},
 	{App: "Codex CLI", Identifiers: CodexCLI},
 	{App: "Codex Desktop", Identifiers: CodexDesktop},
+	{App: "OMP", Identifiers: OmpCLI},
 	{App: "Cursor", Identifiers: Cursor},
 	{App: "Kilo Code", Identifiers: KiloCode},
 	{App: "Roo Code", Identifiers: RooCode},

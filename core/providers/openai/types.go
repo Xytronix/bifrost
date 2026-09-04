@@ -75,13 +75,13 @@ func (r *OpenAIEmbeddingRequest) SetExtraParams(params map[string]interface{}) {
 
 // OpenAIRerankRequest represents an OpenAI-compatible rerank request
 type OpenAIRerankRequest struct {
-	Model           string                   `json:"model"`
-	Query           string                   `json:"query"`
-	Documents       []schemas.RerankDocument `json:"documents"`
-	TopN            *int                     `json:"top_n,omitempty"`
-	MaxTokensPerDoc *int                     `json:"max_tokens_per_doc,omitempty"`
-	Priority        *int                     `json:"priority,omitempty"`
-	ExtraParams     map[string]interface{}   `json:"-"` // Optional: Extra parameters
+	Model           string                 `json:"model"`
+	Query           string                 `json:"query"`
+	Documents       []string               `json:"documents"` // Voyage/Cohere-v2/most /v1/rerank APIs require a plain string array
+	TopN            *int                   `json:"top_n,omitempty"`
+	MaxTokensPerDoc *int                   `json:"max_tokens_per_doc,omitempty"`
+	Priority        *int                   `json:"priority,omitempty"`
+	ExtraParams     map[string]interface{} `json:"-"` // Optional: Extra parameters
 }
 
 func (r *OpenAIRerankRequest) GetExtraParams() map[string]interface{} {
@@ -92,6 +92,7 @@ func (r *OpenAIRerankRequest) GetExtraParams() map[string]interface{} {
 type OpenAIRerankResponse struct {
 	ID      string                       `json:"id"`
 	Results []OpenAIRerankResponseResult `json:"results"`
+	Data    []OpenAIRerankResponseResult `json:"data,omitempty"` // Voyage rerank returns ranked results under "data"
 	Meta    *OpenAIRerankMeta            `json:"meta,omitempty"`
 	Usage   *schemas.BifrostLLMUsage     `json:"usage,omitempty"`
 }

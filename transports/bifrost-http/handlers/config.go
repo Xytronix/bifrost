@@ -729,6 +729,7 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			PricingURL:             bifrost.Ptr(modelcatalog.DefaultPricingURL),
 			PricingSyncInterval:    bifrost.Ptr(int64(modelcatalog.DefaultSyncInterval.Seconds())),
 			ModelParametersURL:     bifrost.Ptr(modelcatalog.DefaultModelParametersURL),
+			ModelsDevURL:           bifrost.Ptr(modelcatalog.DefaultModelsDevURL),
 			MCPLibraryURL:          bifrost.Ptr(modelcatalog.DefaultMCPLibraryURL),
 			MCPLibrarySyncInterval: bifrost.Ptr(int64(modelcatalog.DefaultSyncInterval.Seconds())),
 			LiveModelsSyncInterval: bifrost.Ptr(int64(modelcatalog.DefaultLiveModelsSyncInterval.Seconds())),
@@ -743,6 +744,9 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 	}
 	if frameworkConfig.ModelParametersURL == nil {
 		frameworkConfig.ModelParametersURL = bifrost.Ptr(modelcatalog.DefaultModelParametersURL)
+	}
+	if frameworkConfig.ModelsDevURL == nil {
+		frameworkConfig.ModelsDevURL = bifrost.Ptr(modelcatalog.DefaultModelsDevURL)
 	}
 	if frameworkConfig.MCPLibraryURL == nil {
 		frameworkConfig.MCPLibraryURL = bifrost.Ptr(modelcatalog.DefaultMCPLibraryURL)
@@ -788,6 +792,23 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			shouldReloadFrameworkConfig = true
 		}
 	}
+	if payload.FrameworkConfig.ModelsDevURL != nil {
+		effectiveModelsDevURL := strings.TrimSpace(*payload.FrameworkConfig.ModelsDevURL)
+		if effectiveModelsDevURL == "" {
+			effectiveModelsDevURL = modelcatalog.DefaultModelsDevURL
+		}
+		if effectiveModelsDevURL != *frameworkConfig.ModelsDevURL {
+			if effectiveModelsDevURL != modelcatalog.ModelsDevDisabled {
+				if err := checkURLAccessibility(effectiveModelsDevURL); err != nil {
+					logger.Warn("failed to check the accessibility of the models.dev URL: %v", err)
+					SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("failed to check the accessibility of the models.dev URL: %v", err))
+					return
+				}
+			}
+			frameworkConfig.ModelsDevURL = &effectiveModelsDevURL
+			shouldReloadFrameworkConfig = true
+		}
+	}
 	if payload.FrameworkConfig.MCPLibraryURL != nil {
 		effectiveMCPLibraryURL := *payload.FrameworkConfig.MCPLibraryURL
 		if effectiveMCPLibraryURL == "" {
@@ -825,6 +846,7 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 				PricingURL:             frameworkConfig.PricingURL,
 				PricingSyncInterval:    &syncSeconds,
 				ModelParametersURL:     frameworkConfig.ModelParametersURL,
+				ModelsDevURL:           frameworkConfig.ModelsDevURL,
 				MCPLibraryURL:          frameworkConfig.MCPLibraryURL,
 				MCPLibrarySyncInterval: frameworkConfig.MCPLibrarySyncInterval,
 				LiveModelsSyncInterval: frameworkConfig.LiveModelsSyncInterval,

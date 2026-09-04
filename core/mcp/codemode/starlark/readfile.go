@@ -49,6 +49,11 @@ func (s *StarlarkCodeMode) createReadToolFileTool() schemas.ChatTool {
 			"type":        "string",
 			"description": fileNameDescription,
 		}),
+		schemas.KV("fileNames", map[string]interface{}{
+			"type":        "array",
+			"items":       map[string]interface{}{"type": "string"},
+			"description": "Optional: read multiple stub files in one call (batch). Each entry is a virtual .pyi path like fileName. When provided, fileName/startLine/endLine are ignored and every listed file is returned in full, separated by blank lines. Prefer this over multiple sequential readToolFile calls.",
+		}),
 		schemas.KV("startLine", map[string]interface{}{
 			"type":        "number",
 			"description": "Optional 1-based starting line number for partial file read. Usually not needed - omit to read the entire file. Files are typically small (under 50 lines).",
@@ -66,7 +71,7 @@ func (s *StarlarkCodeMode) createReadToolFileTool() schemas.ChatTool {
 			Parameters: &schemas.ToolFunctionParameters{
 				Type:       "object",
 				Properties: readToolFileProps,
-				Required:   []string{"fileName"},
+				Required:   []string{},
 			},
 		},
 	}
@@ -80,16 +85,93 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 		return nil, fmt.Errorf("failed to parse tool arguments: %v", err)
 	}
 
-	fileName, ok := arguments["fileName"].(string)
-	if !ok || fileName == "" {
-		return nil, fmt.Errorf("fileName parameter is required and must be a string")
+	availableToolsPerClient := s.clientManager.GetToolPerClient(ctx)
+
+	// Batch mode (issue #4434): read multiple stub files in one call.
+	// startLine/endLine are ignored for batch reads — each file is returned in full.
+	if raw, ok := arguments["fileNames"]; ok {
+		var names []string
+		if list, ok := raw.([]interface{}); ok {
+			for _, v := range list {
+				if name, ok := v.(string); ok && strings.TrimSpace(name) != "" {
+					names = append(names, name)
+				}
+			}
+		}
+		if len(names) > 0 {
+			var sb strings.Builder
+			anyMissing := false
+			for i, name := range names {
+				if i > 0 {
+					sb.WriteString("\n\n")
+				}
+				content, matched := s.readToolFileContent(availableToolsPerClient, name)
+				anyMissing = anyMissing || !matched
+				sb.WriteString(content)
+			}
+			return createToolResponseMessage(toolCall, sb.String(), anyMissing), nil
+		}
 	}
 
+	// Single-file mode.
+	fileName, ok := arguments["fileName"].(string)
+	if !ok || fileName == "" {
+		return nil, fmt.Errorf("either fileName (string) or fileNames (array of strings) is required")
+	}
+
+	fileContent, matched := s.readToolFileContent(availableToolsPerClient, fileName)
+
+	// Line slicing only applies to a successfully resolved single file.
+	if matched {
+		var startLine, endLine *int
+		if sl, ok := arguments["startLine"].(float64); ok {
+			slInt := int(sl)
+			startLine = &slInt
+		}
+		if el, ok := arguments["endLine"].(float64); ok {
+			elInt := int(el)
+			endLine = &elInt
+		}
+		if startLine != nil || endLine != nil {
+			lines := strings.Split(fileContent, "\n")
+			totalLines := len(lines)
+			start := 1
+			if startLine != nil {
+				start = *startLine
+			}
+			end := totalLines
+			if endLine != nil {
+				end = *endLine
+			}
+			if start < 1 {
+				start = 1
+			}
+			if start > totalLines {
+				start = totalLines
+			}
+			if end < 1 {
+				end = 1
+			}
+			if end > totalLines {
+				end = totalLines
+			}
+			if start > end {
+				end = start
+			}
+			selectedLines := lines[start-1 : end]
+			fileContent = strings.Join(selectedLines, "\n")
+		}
+	}
+
+	return createToolResponseMessage(toolCall, fileContent, !matched), nil
+}
+
+// readToolFileContent resolves a single VFS .pyi path to its stub text. The bool
+// is false when the path does not resolve, in which case the returned string is
+// a human-readable error suitable for returning to the model.
+func (s *StarlarkCodeMode) readToolFileContent(availableToolsPerClient map[string][]schemas.ChatTool, fileName string) (string, bool) {
 	// Parse the file path to extract server name and optional tool name
 	serverName, toolName, isToolLevel := parseVFSFilePath(fileName)
-
-	// Get available tools per client
-	availableToolsPerClient := s.clientManager.GetToolPerClient(ctx)
 
 	// Find matching client
 	var matchedClientName string
@@ -112,7 +194,6 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 		if clientNameLower == serverNameLower {
 			matchCount++
 			if matchCount > 1 {
-				// Multiple matches found
 				errorMsg := fmt.Sprintf("Multiple servers match filename '%s':\n", fileName)
 				for name := range availableToolsPerClient {
 					if strings.ToLower(name) == serverNameLower {
@@ -120,13 +201,12 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 					}
 				}
 				errorMsg += "\nPlease use a more specific filename. Use the exact display name from listToolFiles to avoid ambiguity."
-				return createToolResponseMessage(toolCall, errorMsg, true), nil
+				return errorMsg, false
 			}
 
 			matchedClientName = clientName
 
 			if isToolLevel {
-				// Tool-level: filter to specific tool
 				var foundTool *schemas.ChatTool
 				for i, tool := range tools {
 					if tool.Function != nil {
@@ -148,22 +228,19 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 					for _, t := range availableTools {
 						errorMsg += fmt.Sprintf("  - servers/%s/%s.pyi\n", clientName, t)
 					}
-					return createToolResponseMessage(toolCall, errorMsg, true), nil
+					return errorMsg, false
 				}
 
 				matchedTools = []schemas.ChatTool{*foundTool}
 			} else {
-				// Server-level: use all tools
 				matchedTools = tools
 			}
 		}
 	}
 
 	if matchedClientName == "" {
-		// Build helpful error message with available files
 		bindingLevel := s.GetBindingLevel()
 		var availableFiles []string
-
 		for name := range availableToolsPerClient {
 			if bindingLevel == schemas.CodeModeBindingLevelServer {
 				availableFiles = append(availableFiles, fmt.Sprintf("servers/%s.pyi", name))
@@ -180,71 +257,20 @@ func (s *StarlarkCodeMode) handleReadToolFile(ctx context.Context, toolCall sche
 				}
 			}
 		}
-
 		errorMsg := fmt.Sprintf("No server found matching '%s'. Available virtual files are:\n", serverName)
 		for _, f := range availableFiles {
 			errorMsg += fmt.Sprintf("  - %s\n", f)
 		}
-		return createToolResponseMessage(toolCall, errorMsg, true), nil
+		return errorMsg, false
 	}
 
 	// Generate compact Python signatures
 	fileContent := generateCompactSignatures(matchedClientName, matchedTools, isToolLevel)
 	lines := strings.Split(fileContent, "\n")
 	totalLines := len(lines)
-
 	// Prepend total lines info so LLM knows the file size upfront
 	fileContent = fmt.Sprintf("# Total lines: %d (this is the complete file, no need to paginate)\n%s", totalLines+1, fileContent)
-	// Recalculate lines after prepending
-	lines = strings.Split(fileContent, "\n")
-	totalLines = len(lines)
-
-	// Handle line slicing if provided
-	var startLine, endLine *int
-	if sl, ok := arguments["startLine"].(float64); ok {
-		slInt := int(sl)
-		startLine = &slInt
-	}
-	if el, ok := arguments["endLine"].(float64); ok {
-		elInt := int(el)
-		endLine = &elInt
-	}
-
-	if startLine != nil || endLine != nil {
-		start := 1
-		if startLine != nil {
-			start = *startLine
-		}
-		end := totalLines
-		if endLine != nil {
-			end = *endLine
-		}
-
-		// Clamp values to valid range instead of erroring
-		// This handles cases where LLM requests more lines than exist
-		if start < 1 {
-			start = 1
-		}
-		if start > totalLines {
-			start = totalLines
-		}
-		if end < 1 {
-			end = 1
-		}
-		if end > totalLines {
-			end = totalLines
-		}
-		if start > end {
-			// If start > end after clamping, just return the start line
-			end = start
-		}
-
-		// Slice lines (convert to 0-based indexing)
-		selectedLines := lines[start-1 : end]
-		fileContent = strings.Join(selectedLines, "\n")
-	}
-
-	return createToolResponseMessage(toolCall, fileContent, false), nil
+	return fileContent, true
 }
 
 // parseVFSFilePath parses a VFS file path and extracts the server name and optional tool name.

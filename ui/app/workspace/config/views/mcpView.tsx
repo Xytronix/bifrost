@@ -42,7 +42,7 @@ export default function MCPView() {
 		oauth2_access_token_ttl: string;
 	}>({
 		mcp_agent_depth: "10",
-		mcp_tool_execution_timeout: "30",
+		mcp_tool_execution_timeout: "180",
 		mcp_code_mode_binding_level: "server",
 		mcp_tool_sync_interval: "10",
 		oauth2_auth_code_ttl: "300",
@@ -54,7 +54,7 @@ export default function MCPView() {
 			setLocalConfig(config);
 			setLocalValues({
 				mcp_agent_depth: config?.mcp_agent_depth?.toString() || "10",
-				mcp_tool_execution_timeout: config?.mcp_tool_execution_timeout?.toString() || "30",
+				mcp_tool_execution_timeout: config?.mcp_tool_execution_timeout?.toString() || "180",
 				mcp_code_mode_binding_level: config?.mcp_code_mode_binding_level || "server",
 				mcp_tool_sync_interval: config?.mcp_tool_sync_interval?.toString() || "10",
 				// Coerce a stored 0 (which the backend treats as "use default") to the

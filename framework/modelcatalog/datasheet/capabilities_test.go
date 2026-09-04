@@ -1,6 +1,7 @@
 package datasheet
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 
@@ -313,5 +314,127 @@ func TestExtractSupportedParams_NoneReasoningEffort(t *testing.T) {
 	}
 	if got := extractSupportedParams(&schemas.ModelCapabilities{}); slices.Contains(got, "supports_none_reasoning_effort") {
 		t.Errorf("expected supported params to omit \"supports_none_reasoning_effort\" when unset, got %v", got)
+	}
+}
+
+func TestEntryUnmarshalJSON_DerivesInputModalitiesFromVision(t *testing.T) {
+	cases := []struct {
+		name    string
+		json    string
+		wantImg bool
+	}{
+		{"supports_vision", `{"provider":"openai","mode":"chat","supports_vision":true}`, true},
+		{"supported_input_modalities", `{"provider":"x","mode":"chat","supported_input_modalities":["text","image"]}`, true},
+		{"supported_modalities", `{"provider":"x","mode":"chat","supported_modalities":["text","image"]}`, true},
+		{"text_only", `{"provider":"openai","mode":"chat","supports_vision":false}`, false},
+		{"no_signal", `{"provider":"openai","mode":"chat"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var entry Entry
+			if err := json.Unmarshal([]byte(tc.json), &entry); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			gotImg := entry.Architecture != nil && slices.Contains(entry.Architecture.InputModalities, "image")
+			if gotImg != tc.wantImg {
+				t.Fatalf("image modality = %v, want %v (architecture=%#v)", gotImg, tc.wantImg, entry.Architecture)
+			}
+		})
+	}
+}
+
+func TestExtractSupportedParams_ReasoningEffortTiers(t *testing.T) {
+	got := extractSupportedParams(&schemas.ModelCapabilities{
+		SupportsReasoning:              capabilityBoolPtr(true),
+		SupportsMinimalReasoningEffort: capabilityBoolPtr(true),
+		SupportsXhighReasoningEffort:   capabilityBoolPtr(true),
+		SupportsAdaptiveThinking:       capabilityBoolPtr(true),
+		SupportsMaxReasoningEffort:     capabilityBoolPtr(false),
+	})
+	for _, want := range []string{
+		"reasoning",
+		"reasoning_effort:minimal",
+		"reasoning_effort:low",
+		"reasoning_effort:medium",
+		"reasoning_effort:high",
+		"reasoning_effort:xhigh",
+		"adaptive_thinking",
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("expected supported params to include %q, got %v", want, got)
+		}
+	}
+	if slices.Contains(got, "reasoning_effort:max") {
+		t.Errorf("expected reasoning_effort:max to be omitted when unset, got %v", got)
+	}
+}
+
+func TestExtractSupportedParams_UsesExplicitReasoningEffortLevels(t *testing.T) {
+	got := extractSupportedParams(&schemas.ModelCapabilities{
+		ReasoningEffortLevels: []string{"minimal", "low", "high", "max"},
+	})
+	for _, want := range []string{
+		"reasoning",
+		"reasoning_effort:minimal",
+		"reasoning_effort:low",
+		"reasoning_effort:high",
+		"reasoning_effort:max",
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("expected supported params to include %q, got %v", want, got)
+		}
+	}
+	for _, unwanted := range []string{"reasoning_effort:medium", "reasoning_effort:xhigh"} {
+		if slices.Contains(got, unwanted) {
+			t.Errorf("expected explicit effort levels to omit %q, got %v", unwanted, got)
+		}
+	}
+}
+
+func TestExtractSupportedParams_BaseEffortScaleForPlainReasoningModel(t *testing.T) {
+	got := extractSupportedParams(&schemas.ModelCapabilities{
+		SupportsReasoning: capabilityBoolPtr(true),
+	})
+	for _, want := range []string{"reasoning_effort:low", "reasoning_effort:medium", "reasoning_effort:high"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("expected supported params to include %q, got %v", want, got)
+		}
+	}
+	for _, unwanted := range []string{"reasoning_effort:minimal", "reasoning_effort:xhigh", "reasoning_effort:max"} {
+		if slices.Contains(got, unwanted) {
+			t.Errorf("expected %q to be omitted when unset, got %v", unwanted, got)
+		}
+	}
+}
+
+func TestExtractSupportedParams_NoEffortScaleForNonReasoningModel(t *testing.T) {
+	got := extractSupportedParams(&schemas.ModelCapabilities{
+		SupportsFunctionCalling: capabilityBoolPtr(true),
+	})
+	for _, unwanted := range []string{"reasoning", "reasoning_effort:low", "reasoning_effort:high"} {
+		if slices.Contains(got, unwanted) {
+			t.Errorf("expected %q to be omitted for a non-reasoning model, got %v", unwanted, got)
+		}
+	}
+}
+
+func TestEntryUnmarshalJSON_DerivesOutputAndRichInputModalities(t *testing.T) {
+	var entry Entry
+	raw := `{"provider":"openai","mode":"chat","supports_vision":true,"supports_audio_input":true,"supports_pdf_input":true,"supported_output_modalities":["text","image"]}`
+	if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if entry.Architecture == nil {
+		t.Fatal("expected architecture to be populated")
+	}
+	for _, want := range []string{"text", "image", "audio", "file"} {
+		if !slices.Contains(entry.Architecture.InputModalities, want) {
+			t.Errorf("expected input modality %q, got %v", want, entry.Architecture.InputModalities)
+		}
+	}
+	for _, want := range []string{"text", "image"} {
+		if !slices.Contains(entry.Architecture.OutputModalities, want) {
+			t.Errorf("expected output modality %q, got %v", want, entry.Architecture.OutputModalities)
+		}
 	}
 }

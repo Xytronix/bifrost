@@ -71,6 +71,10 @@ type ModelCapabilities struct {
 	SupportsResponseSchema          *bool `json:"supports_response_schema,omitempty"`
 	SupportsReasoningWithToolCalls  *bool `json:"supports_reasoning_with_tool_calls,omitempty"`
 	SupportsNoneReasoningEffort     *bool `json:"supports_none_reasoning_effort,omitempty"`
+	SupportsMinimalReasoningEffort  *bool `json:"supports_minimal_reasoning_effort,omitempty"`
+	SupportsLowReasoningEffort      *bool `json:"supports_low_reasoning_effort,omitempty"`
+	SupportsMaxReasoningEffort      *bool `json:"supports_max_reasoning_effort,omitempty"`
+	SupportsXhighReasoningEffort    *bool `json:"supports_xhigh_reasoning_effort,omitempty"`
 	SupportsServiceTier             *bool `json:"supports_service_tier,omitempty"`
 	SupportsPromptCaching           *bool `json:"supports_prompt_caching,omitempty"`
 	SupportsWebSearch               *bool `json:"supports_web_search,omitempty"`

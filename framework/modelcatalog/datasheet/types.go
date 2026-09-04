@@ -69,6 +69,13 @@ func (p *Entry) UnmarshalJSON(data []byte) error {
 			Medium *float64 `json:"search_context_size_medium"`
 			High   *float64 `json:"search_context_size_high"`
 		} `json:"search_context_cost_per_query,omitempty"`
+		SupportsVision            *bool    `json:"supports_vision,omitempty"`
+		SupportedModalities       []string `json:"supported_modalities,omitempty"`
+		SupportedInputModalities  []string `json:"supported_input_modalities,omitempty"`
+		SupportsAudioInput        *bool    `json:"supports_audio_input,omitempty"`
+		SupportsVideoInput        *bool    `json:"supports_video_input,omitempty"`
+		SupportsPdfInput          *bool    `json:"supports_pdf_input,omitempty"`
+		SupportedOutputModalities []string `json:"supported_output_modalities,omitempty"`
 	}
 	if err := sonic.Unmarshal(data, &raw); err != nil {
 		return err
@@ -89,7 +96,65 @@ func (p *Entry) UnmarshalJSON(data []byte) error {
 			p.SearchContextCostPerQuery = q.High
 		}
 	}
+	if inputMods := datasheetInputModalities(raw.SupportsVision, raw.SupportsAudioInput, raw.SupportsVideoInput, raw.SupportsPdfInput, raw.SupportedInputModalities, raw.SupportedModalities); len(inputMods) > 0 {
+		if p.Architecture == nil {
+			p.Architecture = &schemas.Architecture{}
+		}
+		if len(p.Architecture.InputModalities) == 0 {
+			p.Architecture.InputModalities = inputMods
+		}
+	}
+	if outputMods := normalizeModalities(raw.SupportedOutputModalities); len(outputMods) > 0 {
+		if p.Architecture == nil {
+			p.Architecture = &schemas.Architecture{}
+		}
+		if len(p.Architecture.OutputModalities) == 0 {
+			p.Architecture.OutputModalities = outputMods
+		}
+	}
 	return nil
+}
+
+func normalizeModalities(list []string) []string {
+	var out []string
+	for _, m := range list {
+		v := strings.ToLower(strings.TrimSpace(m))
+		if v != "" && !slices.Contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func datasheetInputModalities(supportsVision, supportsAudio, supportsVideo, supportsPDF *bool, explicit ...[]string) []string {
+	isSet := func(b *bool) bool { return b != nil && *b }
+	for _, list := range explicit {
+		mods := normalizeModalities(list)
+		if len(mods) == 0 || (len(mods) == 1 && mods[0] == "text") {
+			continue
+		}
+		if !slices.Contains(mods, "text") {
+			mods = append([]string{"text"}, mods...)
+		}
+		return mods
+	}
+	mods := []string{"text"}
+	if isSet(supportsVision) {
+		mods = append(mods, "image")
+	}
+	if isSet(supportsAudio) {
+		mods = append(mods, "audio")
+	}
+	if isSet(supportsVideo) {
+		mods = append(mods, "video")
+	}
+	if isSet(supportsPDF) {
+		mods = append(mods, "file")
+	}
+	if len(mods) == 1 {
+		return nil
+	}
+	return mods
 }
 
 // Options holds every individual cost field. Embedded into Entry and reused
@@ -546,8 +611,46 @@ func extractSupportedParams(parsed *schemas.ModelCapabilities) []string {
 	if parsed.SupportsToolChoice != nil && *parsed.SupportsToolChoice {
 		addParam("tool_choice")
 	}
-	if parsed.SupportsReasoning != nil && *parsed.SupportsReasoning {
+	extraEffortTiers := []struct {
+		flag  *bool
+		token string
+	}{
+		{parsed.SupportsMinimalReasoningEffort, "reasoning_effort:minimal"},
+		{parsed.SupportsLowReasoningEffort, "reasoning_effort:low"},
+		{parsed.SupportsMaxReasoningEffort, "reasoning_effort:max"},
+		{parsed.SupportsXhighReasoningEffort, "reasoning_effort:xhigh"},
+		{parsed.SupportsNoneReasoningEffort, "reasoning_effort:none"},
+	}
+	reasons := parsed.SupportsReasoning != nil && *parsed.SupportsReasoning
+	reasons = reasons || (parsed.SupportsReasoningEffort != nil && *parsed.SupportsReasoningEffort)
+	reasons = reasons || len(parsed.ReasoningEffortLevels) > 0
+	for _, effort := range extraEffortTiers {
+		if effort.flag != nil && *effort.flag {
+			reasons = true
+			break
+		}
+	}
+	if reasons {
 		addParam("reasoning")
+	}
+	if len(parsed.ReasoningEffortLevels) > 0 {
+		for _, level := range parsed.ReasoningEffortLevels {
+			if level != "" {
+				addParam("reasoning_effort:" + level)
+			}
+		}
+	} else if reasons {
+		addParam("reasoning_effort:low")
+		addParam("reasoning_effort:medium")
+		addParam("reasoning_effort:high")
+		for _, effort := range extraEffortTiers {
+			if effort.flag != nil && *effort.flag {
+				addParam(effort.token)
+			}
+		}
+	}
+	if parsed.SupportsAdaptiveThinking != nil && *parsed.SupportsAdaptiveThinking {
+		addParam("adaptive_thinking")
 	}
 	if parsed.SupportsReasoningWithToolCalls == nil || *parsed.SupportsReasoningWithToolCalls {
 		addParam("reasoning_with_tool_calls")

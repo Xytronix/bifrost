@@ -54,6 +54,11 @@ type CodeModeConfig struct {
 
 	// ToolExecutionTimeout is the maximum time allowed for tool execution
 	ToolExecutionTimeout time.Duration
+
+	// OmitEnvironmentFooter suppresses the trailing environment block when
+	// non-nil and true. Nil means an incremental config update leaves the
+	// current setting unchanged.
+	OmitEnvironmentFooter *bool
 }
 
 // CodeModeDependencies holds the dependencies required by CodeMode implementations.

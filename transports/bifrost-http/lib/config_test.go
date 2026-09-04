@@ -2545,6 +2545,13 @@ func TestConfigSchemaSourceOfTruthValidation(t *testing.T) {
 	require.Error(t, ValidateConfigSchema(invalid))
 }
 
+func TestConfigSchemaModelsDevURLValidation(t *testing.T) {
+	for _, value := range []string{"https://models.dev/catalog.json", modelcatalog.ModelsDevDisabled} {
+		config := []byte(fmt.Sprintf(`{"framework":{"pricing":{"models_dev_url":%q}}}`, value))
+		require.NoError(t, ValidateConfigSchema(config), "models_dev_url=%q", value)
+	}
+}
+
 // Test fixtures
 
 func makeClientConfig(initialPoolSize int, enableLogging bool) *configstore.ClientConfig {
@@ -18409,6 +18416,7 @@ func TestResolveFrameworkPricingConfig(t *testing.T) {
 	defaultModelParamsURL := modelcatalog.DefaultModelParametersURL
 	defaultMCPLibraryURL := modelcatalog.DefaultMCPLibraryURL
 	defaultLiveModelsSyncSeconds := int64(modelcatalog.DefaultLiveModelsSyncInterval.Seconds())
+	defaultModelsDevURL := modelcatalog.DefaultModelsDevURL
 	fileURL := "https://example.com/pricing.json"
 	fileSyncSeconds := int64((12 * time.Hour).Seconds())
 	dbURL := "https://db.example.com/pricing.json"
@@ -18452,6 +18460,7 @@ func TestResolveFrameworkPricingConfig(t *testing.T) {
 			ID:                     8,
 			PricingURL:             &uiEditedURL,
 			PricingSyncInterval:    &uiEditedSync,
+			ModelsDevURL:           &defaultModelsDevURL,
 			ModelParametersURL:     &defaultModelParamsURL,
 			MCPLibraryURL:          &defaultMCPLibraryURL,
 			MCPLibrarySyncInterval: &defaultSyncSeconds,
@@ -18631,6 +18640,41 @@ func TestResolveFrameworkPricingConfig(t *testing.T) {
 		require.Equal(t, defaultMCPLibraryURL, *normalizedModelCatalog.MCPLibraryURL)
 		require.Equal(t, defaultSyncSeconds, *normalizedModelCatalog.MCPLibrarySyncInterval)
 	})
+	t.Run("models dev URL from file preserves explicit opt out", func(t *testing.T) {
+		disabled := modelcatalog.ModelsDevDisabled
+		fileConfig := &framework.FrameworkConfig{
+			Pricing: &modelcatalog.Config{ModelsDevURL: &disabled},
+		}
+
+		normalizedTable, normalizedModelCatalog, _ := ResolveFrameworkPricingConfig(nil, fileConfig)
+		require.Equal(t, disabled, *normalizedTable.ModelsDevURL)
+		require.Equal(t, disabled, *normalizedModelCatalog.ModelsDevURL)
+	})
+
+	t.Run("models dev URL persists explicit opt out", func(t *testing.T) {
+		disabled := modelcatalog.ModelsDevDisabled
+		dbConfig := &tables.TableFrameworkConfig{
+			ID:                     14,
+			PricingURL:             &defaultURL,
+			PricingSyncInterval:    &defaultSyncSeconds,
+			ModelParametersURL:     &defaultModelParamsURL,
+			ModelsDevURL:           &disabled,
+			MCPLibraryURL:          &defaultMCPLibraryURL,
+			MCPLibrarySyncInterval: &defaultSyncSeconds,
+			LiveModelsSyncInterval: &defaultLiveModelsSyncSeconds,
+		}
+
+		normalizedTable, normalizedModelCatalog, needsDBUpdate := ResolveFrameworkPricingConfig(dbConfig, nil)
+		require.False(t, needsDBUpdate)
+		require.Equal(t, disabled, *normalizedTable.ModelsDevURL)
+		require.Equal(t, disabled, *normalizedModelCatalog.ModelsDevURL)
+	})
+
+	t.Run("models dev URL defaults when unset everywhere", func(t *testing.T) {
+		normalizedTable, normalizedModelCatalog, _ := ResolveFrameworkPricingConfig(nil, nil)
+		require.Equal(t, defaultModelsDevURL, *normalizedTable.ModelsDevURL)
+		require.Equal(t, defaultModelsDevURL, *normalizedModelCatalog.ModelsDevURL)
+	})
 
 	t.Run("live models sync interval defaults when unset everywhere", func(t *testing.T) {
 		normalizedTable, normalizedModelCatalog, _ := ResolveFrameworkPricingConfig(nil, nil)
@@ -18793,6 +18837,7 @@ func TestResolveFrameworkPricingConfig(t *testing.T) {
 			PricingURL:             &defaultURL,
 			PricingSyncInterval:    &defaultSyncSeconds,
 			ModelParametersURL:     &defaultModelParamsURL,
+			ModelsDevURL:           &defaultModelsDevURL,
 			MCPLibraryURL:          &uiEditedMCPURL,
 			MCPLibrarySyncInterval: &uiEditedMCPSyncSeconds,
 			// Populated so this stays a pure precedence test: a nil column is a
@@ -20000,7 +20045,7 @@ func assertDefaultClientConfigValues(t *testing.T, cc configstore.ClientConfig) 
 	require.Equal(t, []string{"*"}, cc.AllowedOrigins, "AllowedOrigins should default to [*]")
 	require.Equal(t, 100, cc.MaxRequestBodySizeMB, "MaxRequestBodySizeMB should default to 100")
 	require.Equal(t, 10, cc.MCPAgentDepth, "MCPAgentDepth should default to 10")
-	require.Equal(t, 30, cc.MCPToolExecutionTimeout, "MCPToolExecutionTimeout should default to 30")
+	require.Equal(t, 180, cc.MCPToolExecutionTimeout, "MCPToolExecutionTimeout should default to 180")
 	require.Equal(t, false, cc.MCPEnableTempTokenAuth, "MCPEnableTempTokenAuth should default to false")
 	require.Equal(t, false, cc.Compat.ConvertTextToChat, "Compat.ConvertTextToChat should default to false")
 	require.Equal(t, false, cc.Compat.ConvertChatToResponses, "Compat.ConvertChatToResponses should default to false")

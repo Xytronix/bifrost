@@ -46,18 +46,31 @@ func SecretVarAsString(e *SecretVar) string {
 	return e.GetValue()
 }
 
-// knownProvidersMu protects concurrent access to knownProviders.
+// knownProvidersMu protects concurrent access to the known-provider maps.
 var knownProvidersMu sync.RWMutex
 
-// knownProviders is a set of all known provider strings for O(1) lookup.
-// Built once from StandardProviders at package init time, and dynamically
-// updated when custom providers are added or removed.
-// Used by ParseModelString to distinguish real provider prefixes (e.g. "openai/gpt-4o")
-// from model namespace prefixes (e.g. "meta-llama/Llama-3.1-8B").
+// knownProviders is a set of all known provider strings for O(1) exact-case
+// lookup. Built once from StandardProviders at package init time, and
+// dynamically updated when custom providers are added or removed.
 var knownProviders = func() map[string]bool {
 	m := make(map[string]bool, len(StandardProviders))
 	for _, p := range StandardProviders {
 		m[string(p)] = true
+	}
+	return m
+}()
+
+// knownProvidersLower maps a lowercased provider name to its canonical
+// (as-registered) form, so ParseModelString can match a case-insensitive
+// prefix (e.g. "nvidia/", "OpenAI/") and still return the exact provider key
+// used everywhere else (config, governance provider_configs, routing). Custom
+// providers are frequently registered in display case (e.g. "NVIDIA",
+// "Opera", "Chinese Router"); a lowercase-only match would resolve to "" and
+// silently drop every model for that provider from GET /v1/models.
+var knownProvidersLower = func() map[string]string {
+	m := make(map[string]string, len(StandardProviders))
+	for _, p := range StandardProviders {
+		m[strings.ToLower(string(p))] = string(p)
 	}
 	return m
 }()
@@ -69,6 +82,7 @@ func RegisterKnownProvider(provider ModelProvider) {
 	knownProvidersMu.Lock()
 	defer knownProvidersMu.Unlock()
 	knownProviders[string(provider)] = true
+	knownProvidersLower[strings.ToLower(string(provider))] = string(provider)
 }
 
 // UnregisterKnownProvider removes a custom provider from the known providers set.
@@ -82,26 +96,50 @@ func UnregisterKnownProvider(provider ModelProvider) {
 	knownProvidersMu.Lock()
 	defer knownProvidersMu.Unlock()
 	delete(knownProviders, string(provider))
+	delete(knownProvidersLower, strings.ToLower(string(provider)))
 }
 
-// IsKnownProvider checks if a provider string is known.
+// IsKnownProvider checks if a provider string is known (case-insensitive).
 func IsKnownProvider(provider string) bool {
 	knownProvidersMu.RLock()
 	defer knownProvidersMu.RUnlock()
-	return knownProviders[provider]
+	if knownProviders[provider] {
+		return true
+	}
+	_, ok := knownProvidersLower[strings.ToLower(provider)]
+	return ok
+}
+
+// ResolveKnownProvider resolves a possibly-differently-cased provider string
+// to its canonical registered form. Returns ("", false) when unknown.
+func ResolveKnownProvider(provider string) (ModelProvider, bool) {
+	knownProvidersMu.RLock()
+	defer knownProvidersMu.RUnlock()
+	if knownProviders[provider] {
+		return ModelProvider(provider), true
+	}
+	if canonical, ok := knownProvidersLower[strings.ToLower(provider)]; ok {
+		return ModelProvider(canonical), true
+	}
+	return "", false
 }
 
 // ParseModelString extracts provider and model from a model string.
 // For model strings like "anthropic/claude", it returns ("anthropic", "claude").
 // For model strings like "claude", it returns ("", "claude").
 // Only splits on "/" when the prefix is a known Bifrost provider, so model
-// namespaces like "meta-llama/Llama-3.1-8B" are preserved as-is.
+// namespaces like "meta-llama/Llama-3.1-8B" are preserved as-is. The prefix is
+// matched case-insensitively and the CANONICAL (as-registered) provider name is
+// returned, so a differently-cased prefix (e.g. "nvidia/" for a provider
+// registered as "NVIDIA") still routes and lists correctly.
 func ParseModelString(model string, defaultProvider ModelProvider) (ModelProvider, string) {
 	// Check if model contains a provider prefix (only split on first "/" to preserve model names with "/")
 	if strings.Contains(model, "/") {
 		parts := strings.SplitN(model, "/", 2)
-		if len(parts) == 2 && IsKnownProvider(parts[0]) {
-			return ModelProvider(parts[0]), parts[1]
+		if len(parts) == 2 {
+			if canonical, ok := ResolveKnownProvider(parts[0]); ok {
+				return canonical, parts[1]
+			}
 		}
 	}
 	// No known provider prefix found, return default provider and the original model

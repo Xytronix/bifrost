@@ -21,6 +21,8 @@ func TestDetectAppFromUserAgent(t *testing.T) {
 		{name: "codex desktop native", userAgent: "Codex Desktop/0.142.2 (Mac OS 14.1.0; arm64) unknown (Codex Desktop; 26.623.30605)", want: "Codex Desktop"},
 		{name: "codex desktop windows", userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Codex/1.0 Electron/41.0", want: "Codex Desktop"},
 		{name: "codex desktop linux", userAgent: "Mozilla/5.0 (X11; Linux x86_64) Codex/1.0 Electron/41.0", want: "Codex Desktop"},
+		{name: "omp cli", userAgent: "omp/18.1.9", want: "OMP"},
+		{name: "oh-my-pi cli", userAgent: "oh-my-pi/18.1.9", want: "OMP"},
 		{name: "cursor", userAgent: "Cursor/0.47", want: "Cursor"},
 		{name: "gemini", userAgent: "gemini-cli/1.0", want: "Gemini CLI"},
 		{name: "qwen", userAgent: "qwen-code/1.0", want: "Qwen Code"},
@@ -29,6 +31,7 @@ func TestDetectAppFromUserAgent(t *testing.T) {
 		{name: "kilo before cline", userAgent: "kilo-cline/1.0", want: "Kilo Code"},
 		{name: "roo before cline", userAgent: "roo-cline/1.0", want: "Roo Code"},
 		{name: "cline", userAgent: "cline/3.0.0", want: "Cline"},
+		{name: "browser compatible token is not omp", userAgent: "Mozilla/5.0 (compatible; OMP Thompson; +https://example.com)", want: "Other"},
 		{name: "unknown", userAgent: "custom-client/1.0", want: "Other"},
 		{name: "empty", userAgent: "", want: ""},
 	}

@@ -2071,6 +2071,14 @@ func (provider *OpenAIProvider) Embedding(ctx *schemas.BifrostContext, key schem
 		return nil, err
 	}
 
+	// Custom OpenAI-compatible providers (e.g. Voyage) accept provider-specific
+	// embedding params such as `input_type` that are not part of the OpenAI
+	// schema. Forward those extra params so callers keep document/query
+	// asymmetry and other options; native OpenAI leaves them stripped.
+	if provider.customProviderConfig != nil {
+		ctx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
+	}
+
 	// Use the shared embedding request handler
 	return HandleOpenAIEmbeddingRequest(
 		ctx,

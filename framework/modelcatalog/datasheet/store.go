@@ -28,8 +28,15 @@ const (
 type Config struct {
 	URL                string
 	ModelParametersURL string
-	SyncInterval       time.Duration
+	// ModelsDevURL is the community catalog merged UNDER the datasheet to
+	// cover models it has not published yet. Empty falls back to
+	// DefaultModelsDevURL; ModelsDevDisabled turns the merge off entirely.
+	ModelsDevURL string
+	SyncInterval time.Duration
 }
+
+// ModelsDevDisabled opts a deployment out of the models.dev gap fill.
+const ModelsDevDisabled = "off"
 
 func (c Config) resolved() Config {
 	if c.URL == "" {
@@ -37,6 +44,12 @@ func (c Config) resolved() Config {
 	}
 	if c.ModelParametersURL == "" {
 		c.ModelParametersURL = DefaultModelParametersURL
+	}
+	switch c.ModelsDevURL {
+	case "":
+		c.ModelsDevURL = DefaultModelsDevURL
+	case ModelsDevDisabled:
+		c.ModelsDevURL = ""
 	}
 	if c.SyncInterval <= 0 {
 		c.SyncInterval = DefaultSyncInterval
@@ -65,6 +78,7 @@ type Store struct {
 	// onModelParametersApplied fires after a model-parameters reload lands, so
 	// caches built from the previous sheet can be dropped.
 	onModelParametersApplied func()
+	modelsDevEfforts         map[string][]string                // model → wire reasoning-effort tiers (models.dev overlay)
 	datasheetByProvider      map[schemas.ModelProvider][]string // rebuilt every reload
 	deprecatedByProvider     map[schemas.ModelProvider][]string // rebuilt every reload
 
@@ -85,6 +99,7 @@ type Store struct {
 	syncCfgMu          sync.RWMutex
 	url                string
 	modelParametersURL string
+	modelsDevURL       string
 	syncInterval       time.Duration
 	lastSyncedAt       time.Time
 }
@@ -104,6 +119,7 @@ func New(configStore configstore.ConfigStore, logger schemas.Logger, cfg Config)
 		deprecatedByProvider:   make(map[schemas.ModelProvider][]string),
 		url:                    cfg.URL,
 		modelParametersURL:     cfg.ModelParametersURL,
+		modelsDevURL:           cfg.ModelsDevURL,
 		syncInterval:           cfg.SyncInterval,
 	}
 }
@@ -115,6 +131,7 @@ func (s *Store) UpdateSyncConfig(cfg Config) {
 	s.syncCfgMu.Lock()
 	s.url = cfg.URL
 	s.modelParametersURL = cfg.ModelParametersURL
+	s.modelsDevURL = cfg.ModelsDevURL
 	s.syncInterval = cfg.SyncInterval
 	s.syncCfgMu.Unlock()
 }
@@ -225,6 +242,33 @@ func (s *Store) GetCapabilityEntry(model string, provider schemas.ModelProvider)
 		return entry
 	}
 	return nil
+}
+
+// CapabilityEntriesByBaseName returns a snapshot mapping canonical base model
+// name -> capability entry, aggregated across ALL providers. Used to enrich
+// list-models responses for custom/aggregator providers whose provider name is
+// absent from the pricing catalog but which serve well-known models (e.g. an
+// NVIDIA-hosted "deepseek-v3" or a custom router serving "claude-opus-4-6").
+// Per-base-name selection reuses the same deterministic mode preference as the
+// per-provider lookups.
+func (s *Store) CapabilityEntriesByBaseName() map[string]*Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keysByBase := make(map[string][]string)
+	for key, pricing := range s.pricingData {
+		base := s.baseModelNameUnsafe(pricing.Model)
+		if base == "" {
+			continue
+		}
+		keysByBase[base] = append(keysByBase[base], key)
+	}
+	out := make(map[string]*Entry, len(keysByBase))
+	for base, keys := range keysByBase {
+		if entry := s.selectCapabilityEntryFromKeysUnsafe(keys); entry != nil {
+			out[base] = entry
+		}
+	}
+	return out
 }
 
 // BaseModelName returns the canonical base model name. Uses the pre-computed
@@ -343,6 +387,26 @@ func (s *Store) GetSupportedParameters(model string) []string {
 	}
 	out := make([]string, len(params))
 	copy(out, params)
+	return out
+}
+
+// GetReasoningEfforts returns the model's wire reasoning-effort tiers as
+// published by models.dev, or nil when it is unknown there or exposes no
+// effort-addressed thinking.
+//
+// Deliberately separate from GetSupportedParameters: that list doubles as the
+// compat plugin's request-parameter allowlist, so a models.dev-only entry
+// there would make every unlisted parameter (temperature, tools, …) look
+// unsupported. This is metadata for catalog consumers only.
+func (s *Store) GetReasoningEfforts(model string) []string {
+	s.mu.RLock()
+	efforts, ok := s.modelsDevEfforts[model]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(efforts))
+	copy(out, efforts)
 	return out
 }
 

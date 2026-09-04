@@ -3044,3 +3044,21 @@ func TestMigrationAddBatchJobsAttributionColumns(t *testing.T) {
 	// Migrations are re-run on every boot; the second pass must be a no-op.
 	require.NoError(t, migrationAddBatchJobsAttributionColumns(ctx, db, logger))
 }
+
+func TestMigrationAddModelsDevURLColumn(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TABLE framework_configs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		pricing_url TEXT,
+		pricing_sync_interval INTEGER,
+		model_parameters_url TEXT,
+		config_hash TEXT
+	)`).Error)
+
+	ctx := context.Background()
+	logger := bifrost.NewDefaultLogger(schemas.LogLevelError)
+	require.NoError(t, migrationAddModelsDevURLColumn(ctx, db, logger))
+	require.True(t, db.Migrator().HasColumn(&tables.TableFrameworkConfig{}, "models_dev_url"))
+	require.NoError(t, migrationAddModelsDevURLColumn(ctx, db, logger), "migration must be idempotent")
+}

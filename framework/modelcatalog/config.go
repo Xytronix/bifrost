@@ -45,6 +45,11 @@ type Config struct {
 	PricingSyncInterval *int64  `json:"pricing_sync_interval,omitempty"` // seconds
 	ModelParametersURL  *string `json:"model_parameters_url,omitempty"`
 
+	// ModelsDevURL overrides the community catalog merged UNDER the pricing
+	// datasheet to cover models it has not published yet. Empty/nil uses
+	// DefaultModelsDevURL; set it to ModelsDevDisabled to turn the merge off.
+	ModelsDevURL *string `json:"models_dev_url,omitempty"`
+
 	// MCPLibraryURL overrides the endpoint the MCP server library catalog is
 	// synced from. Empty/nil uses DefaultMCPLibraryURL. Mirrors PricingURL: the
 	// default ships out of the box and the user can point it at a custom source.
@@ -108,6 +113,8 @@ func PricingLookupScopesFromContext(ctx *schemas.BifrostContext, provider string
 const (
 	DefaultPricingURL             = datasheet.DefaultURL
 	DefaultModelParametersURL     = datasheet.DefaultModelParametersURL
+	DefaultModelsDevURL           = datasheet.DefaultModelsDevURL
+	ModelsDevDisabled             = datasheet.ModelsDevDisabled
 	DefaultPricingTimeout         = datasheet.DefaultPricingTimeout
 	DefaultModelParametersTimeout = datasheet.DefaultModelParametersTimeout
 

@@ -1729,6 +1729,7 @@ func GeneratePluginHash(p tables.TablePlugin) (string, error) {
 type frameworkConfigHashPayload struct {
 	PricingURL             *string `json:"pricing_url"`
 	ModelParametersURL     *string `json:"model_parameters_url"`
+	ModelsDevURL           *string `json:"models_dev_url,omitempty"`
 	PricingSyncInterval    *int64  `json:"pricing_sync_interval"`
 	LiveModelsSyncInterval *int64  `json:"live_models_sync_interval,omitempty"`
 }
@@ -1736,6 +1737,7 @@ type frameworkConfigHashPayload struct {
 type frameworkConfigHashPayloadWithMCP struct {
 	PricingURL             *string `json:"pricing_url"`
 	ModelParametersURL     *string `json:"model_parameters_url"`
+	ModelsDevURL           *string `json:"models_dev_url,omitempty"`
 	PricingSyncInterval    *int64  `json:"pricing_sync_interval"`
 	MCPLibraryURL          *string `json:"mcp_library_url"`
 	MCPLibrarySyncInterval *int64  `json:"mcp_library_sync_interval"`
@@ -1746,6 +1748,7 @@ type frameworkConfigHashPayloadWithMCP struct {
 // config.json change-detection hash while preserving the legacy pricing-only
 // hash when omitted.
 type FrameworkConfigHashOptions struct {
+	ModelsDevURL           *string
 	MCPLibraryURL          *string
 	MCPLibrarySyncInterval *int64
 	LiveModelsSyncInterval *int64
@@ -1757,13 +1760,14 @@ func GenerateFrameworkConfigHash(pricingURL *string, modelParametersURL *string,
 	var data []byte
 	var err error
 	if len(opts) > 0 {
-		if opts[0].MCPLibraryURL == nil && opts[0].MCPLibrarySyncInterval == nil {
+		if opts[0].ModelsDevURL == nil && opts[0].MCPLibraryURL == nil && opts[0].MCPLibrarySyncInterval == nil {
 			// Only live-models config was supplied. Staying on the pricing-only
 			// payload keeps the digest identical to a pre-MCP deployment's when
 			// the live interval is also nil.
 			data, err = sonic.Marshal(frameworkConfigHashPayload{
 				PricingURL:             pricingURL,
 				ModelParametersURL:     modelParametersURL,
+				ModelsDevURL:           opts[0].ModelsDevURL,
 				PricingSyncInterval:    pricingSyncInterval,
 				LiveModelsSyncInterval: opts[0].LiveModelsSyncInterval,
 			})
@@ -1772,6 +1776,7 @@ func GenerateFrameworkConfigHash(pricingURL *string, modelParametersURL *string,
 				PricingURL:             pricingURL,
 				ModelParametersURL:     modelParametersURL,
 				PricingSyncInterval:    pricingSyncInterval,
+				ModelsDevURL:           opts[0].ModelsDevURL,
 				MCPLibraryURL:          opts[0].MCPLibraryURL,
 				MCPLibrarySyncInterval: opts[0].MCPLibrarySyncInterval,
 				LiveModelsSyncInterval: opts[0].LiveModelsSyncInterval,

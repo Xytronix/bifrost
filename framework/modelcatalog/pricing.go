@@ -47,6 +47,12 @@ func (mc *ModelCatalog) GetSupportedParameters(model string) []string {
 	return mc.datasheet.GetSupportedParameters(model)
 }
 
+// GetReasoningEfforts returns the model's published wire reasoning-effort
+// tiers (models.dev overlay), or nil when unknown.
+func (mc *ModelCatalog) GetReasoningEfforts(model string) []string {
+	return mc.datasheet.GetReasoningEfforts(model)
+}
+
 // ResolveModelParameters reads the model-parameters row for model, resolving
 // provider-qualified or bare aliases to the datasheet's stored key (exact →
 // provider-prefix-stripped → base model → provider-qualified variants).
@@ -62,6 +68,20 @@ func (mc *ModelCatalog) IsTextCompletionSupported(model string, provider schemas
 // known modes. Used by the inference handler to enrich list-models responses.
 func (mc *ModelCatalog) GetPricingEntryForModel(model string, provider schemas.ModelProvider) *PricingEntry {
 	return mc.datasheet.GetPricingEntryForModel(model, provider)
+}
+
+// BaseModelName returns the canonical base model name for a model string
+// (e.g. "openai/gpt-4o-2024-08-06" -> "gpt-4o").
+func (mc *ModelCatalog) BaseModelName(model string) string {
+	return mc.datasheet.BaseModelName(model)
+}
+
+// CapabilityEntriesByBaseName returns capability metadata indexed by canonical
+// base model name, aggregated across all providers. Used to enrich list-models
+// responses for custom/aggregator providers whose provider name is absent from
+// the pricing catalog but which serve well-known models.
+func (mc *ModelCatalog) CapabilityEntriesByBaseName() map[string]*PricingEntry {
+	return mc.datasheet.CapabilityEntriesByBaseName()
 }
 
 // CalculateCost computes the dollar cost for a Bifrost response.

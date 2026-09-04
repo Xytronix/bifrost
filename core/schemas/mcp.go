@@ -278,6 +278,7 @@ type MCPToolManagerConfig struct {
 	MaxAgentDepth         int                  `json:"max_agent_depth"`
 	CodeModeBindingLevel  CodeModeBindingLevel `json:"code_mode_binding_level,omitempty"`  // How tools are exposed in VFS: "server" or "tool"
 	DisableAutoToolInject bool                 `json:"disable_auto_tool_inject,omitempty"` // When true, MCP tools are not injected into requests by default
+	OmitEnvironmentFooter *bool                `json:"omit_environment_footer,omitempty"`  // Suppress the executeToolCode environment footer
 }
 
 // UnmarshalJSON implements json.Unmarshaler so that tool_execution_timeout treats
@@ -315,8 +316,11 @@ func (c *MCPToolManagerConfig) UnmarshalJSON(data []byte) error {
 }
 
 const (
-	DefaultMaxAgentDepth        = 10
-	DefaultToolExecutionTimeout = 30 * time.Second
+	DefaultMaxAgentDepth = 10
+	// DefaultToolExecutionTimeout is the global per-tool deadline when neither
+	// tool_manager_config nor a per-client override is set. 30s is too short
+	// for IMAP/EWS/SSH-backed MCP servers; 3 minutes still bounds hung backends.
+	DefaultToolExecutionTimeout = 180 * time.Second
 )
 
 // CodeModeBindingLevel defines how tools are exposed in the VFS for code execution

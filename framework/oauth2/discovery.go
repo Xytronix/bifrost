@@ -262,8 +262,12 @@ func fetchSingleAuthServerMetadata(ctx context.Context, issuer string) (*OAuthMe
 	var candidateURLs []string
 	if path != "" {
 		candidateURLs = append(candidateURLs,
-			fmt.Sprintf("%s/.well-known/oauth-authorization-server/%s", base, path),
-			fmt.Sprintf("%s/.well-known/openid-configuration/%s", base, path),
+			fmt.Sprintf("%s/.well-known/oauth-authorization-server/%s", base, path), // RFC 8414 §3.1 path-insertion
+			fmt.Sprintf("%s/.well-known/openid-configuration/%s", base, path),       // OIDC-style path-insertion (some servers)
+			// OIDC Discovery path-append: <issuer>/.well-known/openid-configuration.
+			// Required when the issuer URL carries a path (e.g. https://replit.com/oidc),
+			// which the path-insertion forms above do not cover.
+			fmt.Sprintf("%s/.well-known/openid-configuration", strings.TrimSuffix(issuer, "/")),
 		)
 	}
 	candidateURLs = append(candidateURLs,

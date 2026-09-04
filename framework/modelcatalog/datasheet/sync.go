@@ -72,7 +72,7 @@ func (s *Store) SyncFromURL(ctx context.Context) error {
 		}
 	} else {
 		// No config store — apply the parsed data directly to in-memory state.
-		s.applyPricingData(pricingData)
+		s.applyPricingData(ctx, pricingData)
 	}
 
 	if s.logger != nil {
@@ -93,13 +93,14 @@ func (s *Store) LoadFromDB(ctx context.Context) error {
 		return fmt.Errorf("failed to load pricing from database: %w", err)
 	}
 
+	overlayData := s.modelsDevData(ctx)
 	s.mu.Lock()
 	s.pricingData = make(map[string]configstoreTables.TableModelPricing, len(records))
 	for _, pricing := range records {
 		key := makeKey(pricing.Model, pricing.Provider, pricing.Mode)
 		s.pricingData[key] = pricing
 	}
-	s.rebuildDatasheetViewUnsafe()
+	s.applyModelsDevDataUnsafe(overlayData)
 	s.mu.Unlock()
 
 	if s.logger != nil {
@@ -117,14 +118,15 @@ func (s *Store) LoadFromURLIntoMemory(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load pricing data from URL: %w", err)
 	}
-	s.applyPricingData(pricingData)
+	s.applyPricingData(ctx, pricingData)
 	return nil
 }
 
 // applyPricingData replaces the in-memory pricing cache + datasheet view
 // from a freshly-parsed URL payload. Used by the LoadFromURLIntoMemory
 // path and the no-configstore SyncFromURL fallback.
-func (s *Store) applyPricingData(pricingData map[string]Entry) {
+func (s *Store) applyPricingData(ctx context.Context, pricingData map[string]Entry) {
+	overlayData := s.modelsDevData(ctx)
 	s.mu.Lock()
 	s.pricingData = make(map[string]configstoreTables.TableModelPricing, len(pricingData))
 	for modelKey, entry := range pricingData {
@@ -132,7 +134,7 @@ func (s *Store) applyPricingData(pricingData map[string]Entry) {
 		key := makeKey(pricing.Model, pricing.Provider, pricing.Mode)
 		s.pricingData[key] = pricing
 	}
-	s.rebuildDatasheetViewUnsafe()
+	s.applyModelsDevDataUnsafe(overlayData)
 	s.mu.Unlock()
 }
 

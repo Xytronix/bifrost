@@ -2420,6 +2420,11 @@ func (h *GovernanceHandler) updateVirtualKey(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// Provider grants and model allow/blacklists changed under the same virtual
+	// key value. Drop its cached /v1/models snapshot so the next read reflects
+	// the reloaded governance state immediately.
+	InvalidateListModelsCache()
+
 	SendJSON(ctx, map[string]interface{}{
 		"message":     "Virtual key updated successfully",
 		"virtual_key": preloadedVk,

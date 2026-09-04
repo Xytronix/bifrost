@@ -340,8 +340,9 @@ func Init(ctx context.Context, config schemas.BifrostConfig) (*Bifrost, error) {
 			var codeModeConfig *mcp.CodeModeConfig
 			if mcpConfig.ToolManagerConfig != nil {
 				codeModeConfig = &mcp.CodeModeConfig{
-					BindingLevel:         mcpConfig.ToolManagerConfig.CodeModeBindingLevel,
-					ToolExecutionTimeout: time.Duration(mcpConfig.ToolManagerConfig.ToolExecutionTimeout),
+					BindingLevel:          mcpConfig.ToolManagerConfig.CodeModeBindingLevel,
+					ToolExecutionTimeout:  time.Duration(mcpConfig.ToolManagerConfig.ToolExecutionTimeout),
+					OmitEnvironmentFooter: mcpConfig.ToolManagerConfig.OmitEnvironmentFooter,
 				}
 			}
 			codeMode := starlark.NewStarlarkCodeMode(codeModeConfig, bifrost.logger)

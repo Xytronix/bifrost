@@ -133,6 +133,7 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 	// Format response text
 	var responseText string
 	var executionSuccess bool = true
+	omitEnv := s.omitEnvironmentFooter()
 	if result.Errors != nil {
 		// A sandbox run that raised is a tool failure, not a result. Without the
 		// marker the traceback below reaches the provider as an ordinary tool
@@ -145,13 +146,15 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 		}
 
 		responseText = fmt.Sprintf(
-			"Execution %s error:\n\n%s\n\nHints:\n%s%s\n\nEnvironment:\n  Available server keys: %s",
+			"Execution %s error:\n\n%s\n\nHints:\n%s%s",
 			result.Errors.Kind,
 			result.Errors.Message,
 			strings.Join(result.Errors.Hints, "\n"),
 			logsText,
-			strings.Join(result.Environment.ServerKeys, ", "),
 		)
+		if !omitEnv {
+			responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s", strings.Join(result.Environment.ServerKeys, ", "))
+		}
 		s.logger.Debug("%s Error response formatted. Response length: %d chars", codemcp.CodeModeLogPrefix, len(responseText))
 	} else {
 		hasLogs := len(result.Logs) > 0
@@ -169,11 +172,12 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 			responseText = fmt.Sprintf(
 				"Execution completed but produced no data:\n\n"+
 					"The code executed without errors but returned no output (no print output and no result variable).\n\n"+
-					"Hints:\n%s\n\n"+
-					"Environment:\n  Available server keys: %s",
+					"Hints:\n%s",
 				strings.Join(hints, "\n"),
-				strings.Join(result.Environment.ServerKeys, ", "),
 			)
+			if !omitEnv {
+				responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s", strings.Join(result.Environment.ServerKeys, ", "))
+			}
 			s.logger.Debug("%s No-data failure response formatted. Response length: %d chars", codemcp.CodeModeLogPrefix, len(responseText))
 		} else {
 			if hasLogs {
@@ -192,9 +196,11 @@ func (s *StarlarkCodeMode) handleExecuteToolCode(ctx *schemas.BifrostContext, to
 				}
 			}
 
-			responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s",
-				strings.Join(result.Environment.ServerKeys, ", "))
-			responseText += "\nNote: This is a Starlark (Python subset) environment. Use MCP tools for external interactions."
+			if !omitEnv {
+				responseText += fmt.Sprintf("\n\nEnvironment:\n  Available server keys: %s",
+					strings.Join(result.Environment.ServerKeys, ", "))
+				responseText += "\nNote: This is a Starlark (Python subset) environment. Use MCP tools for external interactions."
+			}
 			s.logger.Debug("%s Success response formatted. Response length: %d chars, Server keys: %v", codemcp.CodeModeLogPrefix, len(responseText), result.Environment.ServerKeys)
 		}
 	}
@@ -485,6 +491,9 @@ func (s *StarlarkCodeMode) callMCPTool(ctx *schemas.BifrostContext, clientName, 
 	defer release()
 
 	toolExecutionTimeout := s.getToolExecutionTimeout()
+	if client.ExecutionConfig != nil && client.ExecutionConfig.ToolExecutionTimeout > 0 {
+		toolExecutionTimeout = client.ExecutionConfig.ToolExecutionTimeout
+	}
 
 	// Delegate to the canonical plugin gate. RunWithPluginPipeline owns the
 	// tracing span, MCPRequestType/ClientName/ToolName stamping (via
@@ -553,9 +562,14 @@ func (s *StarlarkCodeMode) callMCPTool(ctx *schemas.BifrostContext, clientName, 
 			return nil, fmt.Errorf("%s", after)
 		}
 
-		resultStr := formatResultForLog(rawResult)
+		// The raw tool response is already returned to the caller as the tool's
+		// return value (createToolResponseMessage below), which the model sees.
+		// Appending it to the execution logs too would surface the same payload
+		// a second time in the model-visible output, doubling token cost and
+		// defeating code mode's data-reduction purpose. Keep it as a server-side
+		// debug trace instead.
 		logToolName := strings.ReplaceAll(effectiveToolName, "-", "_")
-		appendLog(fmt.Sprintf("[TOOL] %s.%s raw response: %s", clientName, logToolName, resultStr))
+		s.logger.Debug("%s [TOOL] %s.%s raw response: %s", codemcp.CodeModeLogPrefix, clientName, logToolName, formatResultForLog(rawResult))
 
 		// The "Error: " prefix check above catches results a server renders as text;
 		// this carries the protocol-level flag (mcp.CallToolResult.IsError) for

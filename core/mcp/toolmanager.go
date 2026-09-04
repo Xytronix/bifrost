@@ -388,7 +388,7 @@ func buildIntegrationDuplicateCheckMap(existingTools []schemas.ChatTool, integra
 				}
 			}
 		}
-	case schemas.CodexCLI.Matches(integrationUserAgent):
+	case schemas.CodexCLI.Matches(integrationUserAgent), schemas.OmpCLI.Matches(integrationUserAgent):
 		// Codex CLI uses pattern: mcp__{server_name}__{tool_name} (double underscores)
 		// but ALL hyphens in the original Bifrost tool name are converted to underscores.
 		// Strip "mcp__" then skip past the first "__" to get the all-underscore tool name.
@@ -441,7 +441,7 @@ func integrationDuplicateCheck(duplicateCheckMap map[string]bool, toolName strin
 	if duplicateCheckMap[toolName] {
 		return true
 	}
-	if schemas.CodexCLI.Matches(integrationUserAgent) && duplicateCheckMap[strings.ReplaceAll(toolName, "-", "_")] {
+	if (schemas.CodexCLI.Matches(integrationUserAgent) || schemas.OmpCLI.Matches(integrationUserAgent)) && duplicateCheckMap[strings.ReplaceAll(toolName, "-", "_")] {
 		return true
 	}
 	return false
@@ -452,7 +452,7 @@ func integrationDuplicateCheck(duplicateCheckMap map[string]bool, toolName strin
 // form so MCP-only batches cannot inject both "foo-bar" and "foo_bar".
 func markToolSeenInDuplicateCheckMap(duplicateCheckMap map[string]bool, toolName string, integrationUserAgent string) {
 	duplicateCheckMap[toolName] = true
-	if schemas.CodexCLI.Matches(integrationUserAgent) {
+	if schemas.CodexCLI.Matches(integrationUserAgent) || schemas.OmpCLI.Matches(integrationUserAgent) {
 		duplicateCheckMap[strings.ReplaceAll(toolName, "-", "_")] = true
 	}
 }
@@ -1123,11 +1123,13 @@ func (m *ToolsManager) UpdateConfig(config *schemas.MCPToolManagerConfig) {
 		m.maxAgentDepth.Store(int32(config.MaxAgentDepth))
 	}
 
-	// Update CodeMode configuration — propagate whenever either field is set
-	if m.codeMode != nil && (config.CodeModeBindingLevel != "" || config.ToolExecutionTimeout > 0) {
+	// Update CodeMode configuration. Pointer-valued options distinguish an
+	// explicit false from an omitted field in incremental updates.
+	if m.codeMode != nil && (config.CodeModeBindingLevel != "" || config.ToolExecutionTimeout > 0 || config.OmitEnvironmentFooter != nil) {
 		m.codeMode.UpdateConfig(&CodeModeConfig{
-			BindingLevel:         config.CodeModeBindingLevel,
-			ToolExecutionTimeout: time.Duration(config.ToolExecutionTimeout),
+			BindingLevel:          config.CodeModeBindingLevel,
+			ToolExecutionTimeout:  time.Duration(config.ToolExecutionTimeout),
+			OmitEnvironmentFooter: config.OmitEnvironmentFooter,
 		})
 	}
 

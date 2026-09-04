@@ -267,7 +267,7 @@
           "type": "integer",
           "minimum": 1,
           "description": "DEPRECATED: Timeout for individual MCP tool execution in seconds. Use mcp.tool_manager_config.tool_execution_timeout.",
-          "default": 30
+          "default": 180
         },
         "mcp_code_mode_binding_level": {
           "type": "string",
@@ -3892,6 +3892,19 @@
           "optional": true,
           "format": "uri"
         },
+        "models_dev_url": {
+          "description": "URL to the models.dev community catalog used to fill model metadata gaps. Leave empty to use https://models.dev/catalog.json, or set to \"off\" to disable the overlay.",
+          "optional": true,
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "const": "off"
+            }
+          ]
+        },
         "mcp_library_url": {
           "type": "string",
           "description": "URL to a custom MCP server catalog. Leave empty to use the default Bifrost catalog. Accepts a file:// URL to load the catalog from local disk in air-gapped deployments.",
@@ -5462,9 +5475,9 @@
       "properties": {
         "tool_execution_timeout": {
           "type": ["integer", "string"],
-          "description": "Tool execution timeout. Accepts a duration string (e.g. \"30s\", \"2m\") or an integer number of seconds (e.g. 30 means 30 seconds).",
+          "description": "Tool execution timeout. Accepts a duration string (e.g. \"180s\", \"2m\") or an integer number of seconds (e.g. 180 means 180 seconds).",
           "minimum": 1,
-          "default": 30
+          "default": 180
         },
         "max_agent_depth": {
           "type": "integer",
@@ -5480,6 +5493,11 @@
         "disable_auto_tool_inject": {
           "type": "boolean",
           "description": "When true, MCP tools are not automatically injected into requests. Tools are only included when explicitly specified via request context filters or headers, such as x-bf-mcp-include-tools or x-bf-mcp-include-clients.",
+          "default": false
+        },
+        "omit_environment_footer": {
+          "type": "boolean",
+          "description": "When true, executeToolCode responses omit the trailing environment and available-server summary.",
           "default": false
         }
       }

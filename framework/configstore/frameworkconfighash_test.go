@@ -48,6 +48,22 @@ func TestGenerateFrameworkConfigHash_NilLiveIntervalPreservesLegacyDigest(t *tes
 		}
 	})
 
+	t.Run("nil models dev URL preserves legacy digest", func(t *testing.T) {
+		withoutOpts, err := GenerateFrameworkConfigHash(&pricingURL, &modelParamsURL, &syncInterval)
+		if err != nil {
+			t.Fatalf("GenerateFrameworkConfigHash returned error: %v", err)
+		}
+		withNilOpts, err := GenerateFrameworkConfigHash(&pricingURL, &modelParamsURL, &syncInterval, FrameworkConfigHashOptions{
+			ModelsDevURL: nil,
+		})
+		if err != nil {
+			t.Fatalf("GenerateFrameworkConfigHash returned error: %v", err)
+		}
+		if withoutOpts != withNilOpts {
+			t.Fatalf("a nil models.dev URL changed the legacy digest:\n  without: %s\n  with:    %s", withoutOpts, withNilOpts)
+		}
+	})
+
 	t.Run("mcp payload is unchanged by a nil live interval", func(t *testing.T) {
 		mcpURL := "https://example.com/mcp.json"
 		mcpInterval := int64(86400)
@@ -81,6 +97,23 @@ func TestGenerateFrameworkConfigHash_NilLiveIntervalPreservesLegacyDigest(t *tes
 		}
 		if base == withLive {
 			t.Fatal("expected setting live_models_sync_interval to change the digest; a config.json edit would otherwise go undetected")
+		}
+	})
+
+	t.Run("setting models dev URL changes the digest", func(t *testing.T) {
+		base, err := GenerateFrameworkConfigHash(&pricingURL, &modelParamsURL, &syncInterval)
+		if err != nil {
+			t.Fatalf("GenerateFrameworkConfigHash returned error: %v", err)
+		}
+		modelsDevURL := "off"
+		withModelsDev, err := GenerateFrameworkConfigHash(&pricingURL, &modelParamsURL, &syncInterval, FrameworkConfigHashOptions{
+			ModelsDevURL: &modelsDevURL,
+		})
+		if err != nil {
+			t.Fatalf("GenerateFrameworkConfigHash returned error: %v", err)
+		}
+		if base == withModelsDev {
+			t.Fatal("expected setting models_dev_url to change the digest")
 		}
 	})
 }

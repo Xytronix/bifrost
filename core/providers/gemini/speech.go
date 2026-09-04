@@ -88,10 +88,10 @@ func ToGeminiSpeechRequest(bifrostReq *schemas.BifrostSpeechRequest) (*GeminiGen
 	if bifrostReq == nil {
 		return nil, fmt.Errorf("bifrostReq is nil")
 	}
-	// Here we confirm if the response_format is wav or empty string
-	// If its anything else, we will return an error
-	if bifrostReq.Params != nil && bifrostReq.Params.ResponseFormat != "" && bifrostReq.Params.ResponseFormat != "wav" {
-		return nil, fmt.Errorf("gemini does not support response_format: %s. Only wav or empty string is supported which defaults to wav", bifrostReq.Params.ResponseFormat)
+	// Allowed response formats: "wav" (default when absent), or raw "pcm".
+	// Anything else is rejected — Gemini itself only produces PCM samples.
+	if bifrostReq.Params != nil && bifrostReq.Params.ResponseFormat != "" && bifrostReq.Params.ResponseFormat != "wav" && bifrostReq.Params.ResponseFormat != "pcm" {
+		return nil, fmt.Errorf("gemini does not support response_format: %s. Only wav (default), pcm, or empty string are supported", bifrostReq.Params.ResponseFormat)
 	}
 	// Create the base Gemini generation request
 	geminiReq := &GeminiGenerationRequest{
@@ -145,10 +145,11 @@ func (response *GenerateContentResponse) ToBifrostSpeechResponse(ctx context.Con
 				}
 			}
 			if len(audioData) > 0 {
-				responseFormat := ctx.Value(BifrostContextKeyResponseFormat).(string)
-				// Gemini returns PCM audio (s16le, 24000 Hz, mono)
-				// Convert to WAV for standard playable output format
-				if responseFormat == "wav" {
+				// Absent format defaults to WAV: Gemini returns raw PCM (s16le,
+				// 24000 Hz, mono) and clients expect a playable container unless
+				// they explicitly asked for raw PCM.
+				responseFormat, _ := ctx.Value(BifrostContextKeyResponseFormat).(string)
+				if responseFormat != "pcm" {
 					wavData, err := utils.ConvertPCMToWAV(audioData, utils.DefaultGeminiPCMConfig())
 					if err != nil {
 						return nil, fmt.Errorf("failed to convert PCM to WAV: %v", err)

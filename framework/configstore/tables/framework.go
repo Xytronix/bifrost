@@ -7,6 +7,7 @@ type TableFrameworkConfig struct {
 	PricingURL          *string `gorm:"type:text" json:"pricing_url"`
 	PricingSyncInterval *int64  `gorm:"" json:"pricing_sync_interval"`
 	ModelParametersURL  *string `gorm:"type:text" json:"model_parameters_url"`
+	ModelsDevURL        *string `gorm:"type:text" json:"models_dev_url"`
 	// MCPLibraryURL is the endpoint the MCP server library catalog is synced
 	// from. Empty/nil falls back to modelcatalog.DefaultMCPLibraryURL. Mirrors
 	// PricingURL: the default ships out of the box and the user can override it.

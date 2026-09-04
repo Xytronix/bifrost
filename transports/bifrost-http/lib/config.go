@@ -674,7 +674,7 @@ var DefaultClientConfig = configstore.ClientConfig{
 	WhitelistedRoutes:               []string{},
 	MaxRequestBodySizeMB:            100,
 	MCPAgentDepth:                   10,
-	MCPToolExecutionTimeout:         30,
+	MCPToolExecutionTimeout:         int(schemas.DefaultToolExecutionTimeout / time.Second),
 	MCPCodeModeBindingLevel:         string(schemas.CodeModeBindingLevelServer),
 	MCPEnableTempTokenAuth:          false,
 	HideDeletedVirtualKeysInFilters: false,
@@ -4604,17 +4604,20 @@ func ResolveFrameworkPricingConfig(
 ) (*configstoreTables.TableFrameworkConfig, *modelcatalog.Config, bool) {
 	defaultPricingURL := modelcatalog.DefaultPricingURL
 	defaultModelParametersURL := modelcatalog.DefaultModelParametersURL
+	defaultModelsDevURL := modelcatalog.DefaultModelsDevURL
 	defaultSyncSeconds := int64(modelcatalog.DefaultSyncInterval.Seconds())
 	defaultLiveModelsSyncSeconds := int64(modelcatalog.DefaultLiveModelsSyncInterval.Seconds())
 
 	filePricingURL := (*string)(nil)
 	fileModelParametersURL := (*string)(nil)
+	fileModelsDevURL := (*string)(nil)
 	fileSyncSeconds := (*int64)(nil)
 	fileMCPLibraryURL := (*string)(nil)
 	fileMCPLibrarySyncSeconds := (*int64)(nil)
 	fileLiveModelsSyncSeconds := (*int64)(nil)
 	skipURLBackfill := false // prevent DB backfill of unresolved env references
 	skipModelParamsURLBackfill := false
+	skipModelsDevURLBackfill := false
 	skipMCPLibraryURLBackfill := false
 	if fileConfig != nil && fileConfig.Pricing != nil {
 		if fileConfig.Pricing.PricingURL != nil {
@@ -4650,6 +4653,26 @@ func ResolveFrameworkPricingConfig(
 				}
 			} else {
 				fileModelParametersURL = &raw
+			}
+		}
+		if fileConfig.Pricing.ModelsDevURL != nil {
+			raw := strings.TrimSpace(*fileConfig.Pricing.ModelsDevURL)
+			if raw == "" {
+				// Blank is treated as "not set"; fall back to default.
+			} else if strings.HasPrefix(raw, "env.") {
+				resolvedURL, err := envutils.ProcessEnvValue(raw)
+				if err != nil {
+					logger.Warn("models_dev_url: env variable not found (%v); keeping original value %q", err, raw)
+					fileModelsDevURL = &raw
+					skipModelsDevURLBackfill = true
+				} else {
+					resolved := strings.TrimSpace(resolvedURL)
+					if resolved != "" {
+						fileModelsDevURL = &resolved
+					}
+				}
+			} else {
+				fileModelsDevURL = &raw
 			}
 		}
 		if fileConfig.Pricing.PricingSyncInterval != nil {
@@ -4728,6 +4751,7 @@ func ResolveFrameworkPricingConfig(
 
 	resolvedPricingURL := &defaultPricingURL
 	resolvedModelParametersURL := &defaultModelParametersURL
+	resolvedModelsDevURL := &defaultModelsDevURL
 	resolvedSyncSeconds := &defaultSyncSeconds
 
 	defaultMCPLibraryURL := modelcatalog.DefaultMCPLibraryURL
@@ -4743,6 +4767,10 @@ func ResolveFrameworkPricingConfig(
 	if fileModelParametersURL != nil {
 		resolvedModelParametersURL = fileModelParametersURL
 		logger.Debug("model_parameters_url resolved from file")
+	}
+	if fileModelsDevURL != nil {
+		resolvedModelsDevURL = fileModelsDevURL
+		logger.Debug("models_dev_url resolved from file")
 	}
 	if fileSyncSeconds != nil {
 		resolvedSyncSeconds = fileSyncSeconds
@@ -4771,9 +4799,10 @@ func ResolveFrameworkPricingConfig(
 	// Hash the file-resolved values; skip if nothing valid survived Phase 1.
 	fileHash := ""
 	fileHasHashableMCPConfig := (fileMCPLibraryURL != nil && !skipMCPLibraryURLBackfill) || fileMCPLibrarySyncSeconds != nil
+	fileHasHashableModelsDevConfig := fileModelsDevURL != nil && !skipModelsDevURLBackfill
 	// Folded into the same predicate so a config.json edit that touches only
 	// live_models_sync_interval still registers as a file change.
-	fileHasHashableOptionalConfig := fileHasHashableMCPConfig || fileLiveModelsSyncSeconds != nil
+	fileHasHashableOptionalConfig := fileHasHashableMCPConfig || fileHasHashableModelsDevConfig || fileLiveModelsSyncSeconds != nil
 	if fileConfig != nil && fileConfig.Pricing != nil && !skipURLBackfill && (filePricingURL != nil || (fileModelParametersURL != nil && !skipModelParamsURLBackfill) || fileSyncSeconds != nil || fileHasHashableOptionalConfig) {
 		var h string
 		var err error
@@ -4782,7 +4811,12 @@ func ResolveFrameworkPricingConfig(
 			if skipMCPLibraryURLBackfill {
 				mcpHashURL = nil
 			}
+			modelsDevHashURL := fileModelsDevURL
+			if skipModelsDevURLBackfill {
+				modelsDevHashURL = nil
+			}
 			h, err = configstore.GenerateFrameworkConfigHash(filePricingURL, fileModelParametersURL, fileSyncSeconds, configstore.FrameworkConfigHashOptions{
+				ModelsDevURL:           modelsDevHashURL,
 				MCPLibraryURL:          mcpHashURL,
 				MCPLibrarySyncInterval: fileMCPLibrarySyncSeconds,
 				LiveModelsSyncInterval: fileLiveModelsSyncSeconds,
@@ -4824,6 +4858,21 @@ func ResolveFrameworkPricingConfig(
 				resolvedModelParametersURL = dbConfig.ModelParametersURL
 			}
 		} else if !skipModelParamsURLBackfill {
+			needsDBUpdate = true
+		}
+
+		if dbConfig.ModelsDevURL != nil {
+			if trimmed := strings.TrimSpace(*dbConfig.ModelsDevURL); trimmed != "" {
+				if fileChanged && fileModelsDevURL != nil && !skipModelsDevURLBackfill {
+					logger.Info("models_dev_url from config.json overrides DB (file hash changed) — updating DB")
+					needsDBUpdate = true
+				} else {
+					resolvedModelsDevURL = &trimmed
+				}
+			} else if !skipModelsDevURLBackfill {
+				needsDBUpdate = true
+			}
+		} else if !skipModelsDevURLBackfill {
 			needsDBUpdate = true
 		}
 
@@ -4945,6 +4994,10 @@ func ResolveFrameworkPricingConfig(
 		logger.Warn("invariant violation: model_parameters_url resolved to nil — falling back to default %q", defaultModelParametersURL)
 		resolvedModelParametersURL = &defaultModelParametersURL
 	}
+	if resolvedModelsDevURL == nil {
+		logger.Warn("invariant violation: models_dev_url resolved to nil — falling back to default %q", defaultModelsDevURL)
+		resolvedModelsDevURL = &defaultModelsDevURL
+	}
 	if resolvedSyncSeconds == nil {
 		logger.Warn("invariant violation: pricing_sync_interval resolved to nil — falling back to default %d seconds", defaultSyncSeconds)
 		resolvedSyncSeconds = &defaultSyncSeconds
@@ -4970,22 +5023,24 @@ func ResolveFrameworkPricingConfig(
 	}
 
 	return &configstoreTables.TableFrameworkConfig{
-			ID:                     configID,
-			PricingURL:             resolvedPricingURL,
-			PricingSyncInterval:    resolvedSyncSeconds,
-			ModelParametersURL:     resolvedModelParametersURL,
-			MCPLibraryURL:          resolvedMCPLibraryURL,
-			MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
-			LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
-			ConfigHash:             persistedHash,
-		}, &modelcatalog.Config{
-			PricingURL:             resolvedPricingURL,
-			PricingSyncInterval:    resolvedSyncSeconds,
-			ModelParametersURL:     resolvedModelParametersURL,
-			MCPLibraryURL:          resolvedMCPLibraryURL,
-			MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
-			LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
-		}, needsDBUpdate
+		ID:                     configID,
+		PricingURL:             resolvedPricingURL,
+		PricingSyncInterval:    resolvedSyncSeconds,
+		ModelParametersURL:     resolvedModelParametersURL,
+		ModelsDevURL:           resolvedModelsDevURL,
+		MCPLibraryURL:          resolvedMCPLibraryURL,
+		MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
+		LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
+		ConfigHash:             persistedHash,
+	}, &modelcatalog.Config{
+		PricingURL:             resolvedPricingURL,
+		PricingSyncInterval:    resolvedSyncSeconds,
+		ModelParametersURL:     resolvedModelParametersURL,
+		ModelsDevURL:           resolvedModelsDevURL,
+		MCPLibraryURL:          resolvedMCPLibraryURL,
+		MCPLibrarySyncInterval: resolvedMCPLibrarySyncInterval,
+		LiveModelsSyncInterval: resolvedLiveModelsSyncInterval,
+	}, needsDBUpdate
 }
 
 // initFrameworkConfig initializes framework config and pricing manager from file
