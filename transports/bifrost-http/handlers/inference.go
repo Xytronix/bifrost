@@ -1013,6 +1013,9 @@ func enrichListModelsResponse(resp *schemas.BifrostListModelsResponse, catalog *
 		if len(efforts) > 0 {
 			modelEntry.SupportedParameters = withReasoningEffortTiers(modelEntry.SupportedParameters, efforts)
 		}
+		if modelEntry.Benchmarks == nil {
+			modelEntry.Benchmarks = benchmarksForModel(string(provider), modelName, modelEntry.Alias)
+		}
 		resp.Data[i] = modelEntry
 	}
 }

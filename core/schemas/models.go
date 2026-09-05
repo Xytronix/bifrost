@@ -175,6 +175,11 @@ type Model struct {
 	OwnedBy          *string  `json:"owned_by,omitempty"`
 	SupportedMethods []string `json:"supported_methods,omitempty"`
 
+	// Benchmarks carries independent capability scores for this model, filled
+	// by the gateway when a score source is configured, so consumers can rank
+	// models without each client holding its own benchmark API key.
+	Benchmarks *ModelBenchmarks `json:"benchmarks,omitempty"`
+
 	// ProviderExtra carries opaque provider-specific data (e.g. Anthropic capabilities)
 	// through the Bifrost pipeline for integration reverse-conversion. Never serialized.
 	ProviderExtra json.RawMessage `json:"-"`
@@ -186,6 +191,17 @@ type Architecture struct {
 	InstructType     *string  `json:"instruct_type,omitempty"`
 	InputModalities  []string `json:"input_modalities,omitempty"`
 	OutputModalities []string `json:"output_modalities,omitempty"`
+}
+
+// ModelBenchmarks reports third-party capability scores on the publisher's own
+// scale. Source is carried with the numbers because the scales are not
+// comparable across publishers or index revisions, and because attribution is
+// a condition of use for every provider of this data.
+type ModelBenchmarks struct {
+	Intelligence          *float64 `json:"intelligence,omitempty"`
+	Coding                *float64 `json:"coding,omitempty"`
+	OutputTokensPerSecond *float64 `json:"output_tokens_per_second,omitempty"`
+	Source                string   `json:"source,omitempty"`
 }
 
 type Pricing struct {
