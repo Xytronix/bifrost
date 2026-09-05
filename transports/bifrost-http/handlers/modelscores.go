@@ -22,8 +22,21 @@ import (
 //
 // Enabled by AA_API_KEY. Unset means no score request leaves the gateway and
 // the field is simply absent — never fabricated.
+//
+// The publisher's rate limit is a fixed 24-hour window scoped to the ORG, not
+// the key (free tier 100 requests, pro 500), and it is shared by every service
+// using that organisation's keys. One gateway refreshing on a six-hour TTL
+// spends 4 of those; the same catalog fanned out to N machines would spend 4N
+// and starve everything else — which is the other reason this belongs here and
+// not in each client.
 const (
-	aaScoresURL       = "https://artificialanalysis.ai/api/v2/data/llms/models"
+	// The legacy /api/v2/data/llms/models path returns 410 Gone after
+	// 2026-11-04; these are its supported replacements. The free endpoint is
+	// the public subset of the same shape and accepts any tier's key, so a key
+	// whose tier does not cover the pro endpoint (403) still gets headline
+	// indices and median performance.
+	aaScoresURL       = "https://artificialanalysis.ai/api/v2/language/models"
+	aaScoresFreeURL   = "https://artificialanalysis.ai/api/v2/language/models/free"
 	aaScoresSource    = "artificialanalysis.ai"
 	aaScoresTTL       = 6 * time.Hour
 	aaScoresTimeout   = 15 * time.Second
@@ -145,16 +158,21 @@ func (idx *modelScoreIndex) ensureFresh() {
 	go func() {
 		rows, err := fetchAAScores(strings.TrimSpace(os.Getenv("AA_API_KEY")))
 		idx.mu.Lock()
-		defer idx.mu.Unlock()
 		idx.refreshing = false
 		// A short payload is a stub, a truncated mirror, or an intercepted
 		// transport: keep the previous snapshot rather than pin the catalog to
 		// a handful of scores for the whole TTL.
 		if err != nil || len(rows) < aaScoresMinRows {
+			idx.mu.Unlock()
 			return
 		}
 		idx.byKey = rows
 		idx.fetchedAt = time.Now()
+		idx.mu.Unlock()
+		// The list response is cached per virtual key, so the snapshot that
+		// filled while the first (score-less) response was being cached would
+		// otherwise not surface until that entry expired.
+		MarkListModelsCacheStale()
 	}()
 }
 
@@ -167,9 +185,22 @@ type aaModelsResponse struct {
 }
 
 func fetchAAScores(apiKey string) (map[string]modelScore, error) {
+	payload, err := fetchAAPayload(apiKey, aaScoresURL)
+	// 403 means the key is valid but its tier does not cover this endpoint;
+	// the free endpoint serves the public subset of the same shape.
+	if scoreErr, ok := err.(*scoreFetchError); ok && scoreErr.status == http.StatusForbidden {
+		payload, err = fetchAAPayload(apiKey, aaScoresFreeURL)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return scoreRowsFromPayload(payload), nil
+}
+
+func fetchAAPayload(apiKey, url string) (*aaModelsResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), aaScoresTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, aaScoresURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +217,13 @@ func fetchAAScores(apiKey string) (map[string]modelScore, error) {
 	var payload aaModelsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, err
+	}
+	return &payload, nil
+}
+
+func scoreRowsFromPayload(payload *aaModelsResponse) map[string]modelScore {
+	if payload == nil {
+		return nil
 	}
 	rows := make(map[string]modelScore, len(payload.Data))
 	for _, entry := range payload.Data {
@@ -210,7 +248,7 @@ func fetchAAScores(apiKey string) (map[string]modelScore, error) {
 		}
 		rows[key] = score
 	}
-	return rows, nil
+	return rows
 }
 
 type scoreFetchError struct {
