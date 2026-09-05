@@ -48,6 +48,7 @@ const (
 type modelScore struct {
 	Intelligence *float64
 	Coding       *float64
+	Agentic      *float64
 	TokensPerSec *float64
 }
 
@@ -121,6 +122,7 @@ func benchmarksForModel(provider, model string, alias *string) *schemas.ModelBen
 			return &schemas.ModelBenchmarks{
 				Intelligence:          score.Intelligence,
 				Coding:                score.Coding,
+				Agentic:               score.Agentic,
 				OutputTokensPerSecond: score.TokensPerSec,
 				Source:                aaScoresSource,
 			}
@@ -181,7 +183,11 @@ type aaModelsResponse struct {
 	Data []struct {
 		Slug        string             `json:"slug"`
 		Evaluations map[string]float64 `json:"evaluations"`
-		OutputTPS   *float64           `json:"median_output_tokens_per_second"`
+		// The legacy endpoint reported speed flat; the supported ones nest it.
+		OutputTPS   *float64 `json:"median_output_tokens_per_second"`
+		Performance *struct {
+			OutputTPS *float64 `json:"median_output_tokens_per_second"`
+		} `json:"performance"`
 	} `json:"data"`
 	// The supported endpoints paginate at 200 rows; the legacy one did not.
 	Pagination *struct {
@@ -280,12 +286,21 @@ func scoreRowsFromPayload(payload *aaModelsResponse) map[string]modelScore {
 		if value, ok := entry.Evaluations["artificial_analysis_coding_index"]; ok {
 			score.Coding = &value
 		}
+		// Agentic scoring is the closest published proxy for tool-driven
+		// coding work, which is what most gateway traffic actually is.
+		if value, ok := entry.Evaluations["artificial_analysis_agentic_index"]; ok {
+			score.Agentic = &value
+		}
 		// Unmeasured speed is published as 0 rather than omitted.
-		if entry.OutputTPS != nil && *entry.OutputTPS > 0 {
-			value := *entry.OutputTPS
+		speed := entry.OutputTPS
+		if speed == nil && entry.Performance != nil {
+			speed = entry.Performance.OutputTPS
+		}
+		if speed != nil && *speed > 0 {
+			value := *speed
 			score.TokensPerSec = &value
 		}
-		if score.Intelligence == nil && score.Coding == nil && score.TokensPerSec == nil {
+		if score.Intelligence == nil && score.Coding == nil && score.Agentic == nil && score.TokensPerSec == nil {
 			continue
 		}
 		rows[key] = score

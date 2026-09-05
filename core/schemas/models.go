@@ -200,6 +200,7 @@ type Architecture struct {
 type ModelBenchmarks struct {
 	Intelligence          *float64 `json:"intelligence,omitempty"`
 	Coding                *float64 `json:"coding,omitempty"`
+	Agentic               *float64 `json:"agentic,omitempty"`
 	OutputTokensPerSecond *float64 `json:"output_tokens_per_second,omitempty"`
 	Source                string   `json:"source,omitempty"`
 }

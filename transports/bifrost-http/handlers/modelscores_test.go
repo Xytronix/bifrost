@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -94,30 +95,33 @@ func TestEnrichListModelsResponse_AttachesBenchmarks(t *testing.T) {
 	}
 }
 
-func TestScoreRowsFromPayload_SkipsUnmeasuredSpeed(t *testing.T) {
-	zero := 0.0
-	measured := 120.5
-	payload := &aaModelsResponse{}
-	payload.Data = append(payload.Data,
-		struct {
-			Slug        string             `json:"slug"`
-			Evaluations map[string]float64 `json:"evaluations"`
-			OutputTPS   *float64           `json:"median_output_tokens_per_second"`
-		}{Slug: "unmeasured", Evaluations: map[string]float64{"artificial_analysis_intelligence_index": 47}, OutputTPS: &zero},
-		struct {
-			Slug        string             `json:"slug"`
-			Evaluations map[string]float64 `json:"evaluations"`
-			OutputTPS   *float64           `json:"median_output_tokens_per_second"`
-		}{Slug: "measured", Evaluations: map[string]float64{"artificial_analysis_intelligence_index": 50}, OutputTPS: &measured},
-	)
+func TestScoreRowsFromPayload_ParsesSupportedShape(t *testing.T) {
+	// Verbatim shape of the supported endpoint: speed nested under
+	// "performance", "not measured" published as 0, agentic index present.
+	var payload aaModelsResponse
+	if err := json.Unmarshal([]byte(`{"data":[
+		{"slug":"unmeasured","evaluations":{"artificial_analysis_intelligence_index":47,"artificial_analysis_agentic_index":30},"performance":{"median_output_tokens_per_second":0}},
+		{"slug":"measured","evaluations":{"artificial_analysis_intelligence_index":50,"artificial_analysis_coding_index":41},"performance":{"median_output_tokens_per_second":120.5}},
+		{"slug":"legacy-flat","evaluations":{"artificial_analysis_intelligence_index":51},"median_output_tokens_per_second":61.01}
+	]}`), &payload); err != nil {
+		t.Fatalf("payload must parse: %v", err)
+	}
 
-	rows := scoreRowsFromPayload(payload)
-	// The publisher encodes "not measured" as 0, which must not become a score.
+	rows := scoreRowsFromPayload(&payload)
 	if got := rows["unmeasured"]; got.TokensPerSec != nil {
 		t.Fatalf("zero speed must be dropped, got %v", *got.TokensPerSec)
 	}
-	if got := rows["measured"]; got.TokensPerSec == nil || *got.TokensPerSec != measured {
-		t.Fatalf("measured speed must survive, got %#v", got.TokensPerSec)
+	if got := rows["unmeasured"]; got.Agentic == nil || *got.Agentic != 30 {
+		t.Fatalf("agentic index must be read, got %#v", got.Agentic)
+	}
+	if got := rows["measured"]; got.TokensPerSec == nil || *got.TokensPerSec != 120.5 {
+		t.Fatalf("nested speed must be read, got %#v", got.TokensPerSec)
+	}
+	if got := rows["measured"]; got.Coding == nil || *got.Coding != 41 {
+		t.Fatalf("coding index must be read, got %#v", got.Coding)
+	}
+	if got := rows["legacy-flat"]; got.TokensPerSec == nil || *got.TokensPerSec != 61.01 {
+		t.Fatalf("flat speed must still be read, got %#v", got.TokensPerSec)
 	}
 }
 
