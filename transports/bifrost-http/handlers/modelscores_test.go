@@ -93,3 +93,53 @@ func TestEnrichListModelsResponse_AttachesBenchmarks(t *testing.T) {
 		t.Fatalf("expected output speed to be exposed, got %#v", got.OutputTokensPerSecond)
 	}
 }
+
+func TestScoreRowsFromPayload_SkipsUnmeasuredSpeed(t *testing.T) {
+	zero := 0.0
+	measured := 120.5
+	payload := &aaModelsResponse{}
+	payload.Data = append(payload.Data,
+		struct {
+			Slug        string             `json:"slug"`
+			Evaluations map[string]float64 `json:"evaluations"`
+			OutputTPS   *float64           `json:"median_output_tokens_per_second"`
+		}{Slug: "unmeasured", Evaluations: map[string]float64{"artificial_analysis_intelligence_index": 47}, OutputTPS: &zero},
+		struct {
+			Slug        string             `json:"slug"`
+			Evaluations map[string]float64 `json:"evaluations"`
+			OutputTPS   *float64           `json:"median_output_tokens_per_second"`
+		}{Slug: "measured", Evaluations: map[string]float64{"artificial_analysis_intelligence_index": 50}, OutputTPS: &measured},
+	)
+
+	rows := scoreRowsFromPayload(payload)
+	// The publisher encodes "not measured" as 0, which must not become a score.
+	if got := rows["unmeasured"]; got.TokensPerSec != nil {
+		t.Fatalf("zero speed must be dropped, got %v", *got.TokensPerSec)
+	}
+	if got := rows["measured"]; got.TokensPerSec == nil || *got.TokensPerSec != measured {
+		t.Fatalf("measured speed must survive, got %#v", got.TokensPerSec)
+	}
+}
+
+func TestMorePages_WalksEveryPageThenStops(t *testing.T) {
+	payload := &aaModelsResponse{}
+	payload.Pagination = &struct {
+		Page       int  `json:"page"`
+		TotalPages int  `json:"total_pages"`
+		HasMore    bool `json:"has_more"`
+	}{Page: 1, TotalPages: 4, HasMore: true}
+
+	// The supported endpoints page at 200 rows: stopping at page 1 silently
+	// drops three quarters of the scored catalog.
+	for page := 2; page <= 4; page++ {
+		if !morePages(payload, page) {
+			t.Fatalf("page %d must be fetched", page)
+		}
+	}
+	if morePages(payload, 5) {
+		t.Fatalf("must not walk past total_pages")
+	}
+	if morePages(&aaModelsResponse{}, 2) {
+		t.Fatalf("an unpaginated payload must not request a second page")
+	}
+}

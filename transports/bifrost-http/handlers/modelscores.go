@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -182,24 +183,65 @@ type aaModelsResponse struct {
 		Evaluations map[string]float64 `json:"evaluations"`
 		OutputTPS   *float64           `json:"median_output_tokens_per_second"`
 	} `json:"data"`
+	// The supported endpoints paginate at 200 rows; the legacy one did not.
+	Pagination *struct {
+		Page       int  `json:"page"`
+		TotalPages int  `json:"total_pages"`
+		HasMore    bool `json:"has_more"`
+	} `json:"pagination"`
 }
 
+// aaScoresMaxPages bounds the walk so a publisher-side pagination bug cannot
+// spin the refresh: 200 rows a page covers several times the ~650 scored
+// models.
+const aaScoresMaxPages = 12
+
 func fetchAAScores(apiKey string) (map[string]modelScore, error) {
-	payload, err := fetchAAPayload(apiKey, aaScoresURL)
+	baseURL := aaScoresURL
+	payload, err := fetchAAPayload(apiKey, baseURL, 1)
 	// 403 means the key is valid but its tier does not cover this endpoint;
 	// the free endpoint serves the public subset of the same shape.
 	if scoreErr, ok := err.(*scoreFetchError); ok && scoreErr.status == http.StatusForbidden {
-		payload, err = fetchAAPayload(apiKey, aaScoresFreeURL)
+		baseURL = aaScoresFreeURL
+		payload, err = fetchAAPayload(apiKey, baseURL, 1)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return scoreRowsFromPayload(payload), nil
+	rows := scoreRowsFromPayload(payload)
+	for page := 2; page <= aaScoresMaxPages && morePages(payload, page); page++ {
+		next, err := fetchAAPayload(apiKey, baseURL, page)
+		if err != nil {
+			// Keep the pages already collected: a partial catalog still beats
+			// none, and the plausibility floor rejects a truncated first page.
+			break
+		}
+		for key, score := range scoreRowsFromPayload(next) {
+			if _, seen := rows[key]; !seen {
+				rows[key] = score
+			}
+		}
+		payload = next
+	}
+	return rows, nil
 }
 
-func fetchAAPayload(apiKey, url string) (*aaModelsResponse, error) {
+func morePages(payload *aaModelsResponse, next int) bool {
+	if payload == nil || payload.Pagination == nil {
+		return false
+	}
+	if payload.Pagination.TotalPages > 0 {
+		return next <= payload.Pagination.TotalPages
+	}
+	return payload.Pagination.HasMore
+}
+
+func fetchAAPayload(apiKey, url string, page int) (*aaModelsResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), aaScoresTimeout)
 	defer cancel()
+	if page > 1 {
+		url = fmt.Sprintf("%s?page=%d", url, page)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
